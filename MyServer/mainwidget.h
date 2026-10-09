@@ -2,7 +2,7 @@
 #define MAINWIDGET_H
 
 #include <QWidget>
-#include "transfertypes.h"
+#include "transferdefaults.h"
 
 class QComboBox;
 class QLineEdit;
@@ -62,7 +62,7 @@ private slots:
      * @brief OnSendFileClicked
      * @param 无
      * @return 无
-     * @details 发起一次多线程文件发送任务。
+     * @details 发起一次 TCP 长连接文件发送任务（待接入）。
      */
     void OnSendFileClicked();
 
@@ -88,17 +88,9 @@ private slots:
      * @param bSuccess 发送是否成功。
      * @param strMessage 完成时的提示消息。
      * @return 无
-     * @details 在所有发送线程结束后恢复界面可操作状态。
+     * @details 在发送会话结束后恢复界面可操作状态。
      */
     void OnSendFinished(bool bSuccess, const QString &strMessage);
-
-    /**
-     * @brief OnTransferModeChanged
-     * @param nCurrentIndex 当前下拉框索引。
-     * @return 无
-     * @details 根据协议模式刷新界面参数语义。
-     */
-    void OnTransferModeChanged(int nCurrentIndex);
 
     /**
      * @brief OnReceiveProgressChanged
@@ -123,36 +115,12 @@ private:
     void InitializeUI();
 
     /**
-     * @brief MainWidget::GetCurrentTransferMode
-     * @param 无
-     * @return 当前界面选择的传输模式。
-     * @details 读取下拉框中保存的枚举值并转成内部模式。
-     */
-    ETransferMode GetCurrentTransferMode() const;
-
-    /**
-     * @brief UpdateModeSpecificUi
-     * @param 无
-     * @return 无
-     * @details 根据 TCP / UDP 模式调整参数标签与启用状态。
-     */
-    void UpdateModeSpecificUi();
-
-    /**
      * @brief UpdateReceiverButtons
      * @param bListening 当前接收端是否正在监听。
      * @return 无
      * @details 统一控制启动/停止接收端按钮的可用状态。
      */
     void UpdateReceiverButtons(bool bListening);
-
-    /**
-     * @brief GetChunkSizeBytes
-     * @param 无
-     * @return 当前界面配置的块大小字节数。
-     * @details 结合数值和单位下拉框，换算出块大小的真实字节数。
-     */
-    qint64 GetChunkSizeBytes() const;
 
     /**
      * @brief GetSegmentSizeBytes
@@ -178,18 +146,14 @@ private:
      */
     void AppendLogMessage(const QString &strMessage);
 
-    QComboBox *m_pModeComboBox;//选择是TCP还是UDP连接
     QLineEdit *m_pBindIpLineEdit;//输入监听IP的地址
     QLineEdit *m_pTargetIpLineEdit;//输入目标的IP地址
     NoWheelSpinBox *m_pListenPortSpinBox;//输入监听的端口
     NoWheelSpinBox *m_pSendPortSpinBox;//输入发送的端口
-    NoWheelSpinBox *m_pThreadCountSpinBox;//输入连接的线程数
-    NoWheelSpinBox *m_pChunkSizeSpinBox;//输入文件块大小：一个线程任务负责发送多大的文件块
+    NoWheelSpinBox *m_pThreadCountSpinBox;//TCP 发送窗口：允许同时未确认的分片数
     NoWheelSpinBox *m_pSegmentSizeSpinBox;//网络分片大小：一个文件块再拆成多大的网络包载荷
-    QComboBox *m_pChunkUnitComboBox; // 选择文件块大小的单位（KB/MB）
     QComboBox *m_pSegmentUnitComboBox;// 选择网络分片大小的单位（KB/MB）
-    QLabel *m_pThreadCountLabel;          // 显示线程数配置项的文字说明
-    QLabel *m_pChunkSizeLabel;            // 显示文件块大小配置项的文字说明
+    QLabel *m_pThreadCountLabel;          // 显示发送窗口配置项的文字说明
     QLabel *m_pSegmentSizeLabel;          // 显示网络分片大小配置项的文字说明
     QLineEdit *m_pFilePathLineEdit;       // 输入或显示待发送文件的路径
     QLineEdit *m_pOutputDirectoryLineEdit;// 输入或显示接收文件的保存目录

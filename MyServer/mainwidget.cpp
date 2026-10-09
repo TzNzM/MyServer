@@ -22,18 +22,14 @@
 MainWidget::MainWidget(QWidget *pParent)
     : QWidget(pParent),
 //      m_pTransferController(new TransferController(this)),
-      m_pModeComboBox(nullptr),
       m_pBindIpLineEdit(nullptr),
       m_pTargetIpLineEdit(nullptr),
       m_pListenPortSpinBox(nullptr),
       m_pSendPortSpinBox(nullptr),
       m_pThreadCountSpinBox(nullptr),
-      m_pChunkSizeSpinBox(nullptr),
       m_pSegmentSizeSpinBox(nullptr),
-      m_pChunkUnitComboBox(nullptr),
       m_pSegmentUnitComboBox(nullptr),
       m_pThreadCountLabel(nullptr),
-      m_pChunkSizeLabel(nullptr),
       m_pSegmentSizeLabel(nullptr),
       m_pFilePathLineEdit(nullptr),
       m_pOutputDirectoryLineEdit(nullptr),
@@ -48,8 +44,6 @@ MainWidget::MainWidget(QWidget *pParent)
     InitializeUI();
 
     //ToDo Connect函数中关于TransferController的
-    //QOverload<int>::of从一组同名函数中，选出“参数类型为 int”的那个版本
-    connect(m_pModeComboBox,QOverload<int>::of(&QComboBox::currentIndexChanged),this,&MainWidget::OnTransferModeChanged);
 
     // 设置默认的地址路径
     const QString strDefaultDownloadPath = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
@@ -59,9 +53,9 @@ MainWidget::MainWidget(QWidget *pParent)
     m_pOutputDirectoryLineEdit->setText(strDefaultOutputDirectory);
     //ToDo m_pTransferController->SetOutputDirectory(strDefaultOutputDirectory);
     UpdateReceiverButtons(false);
-    UpdateModeSpecificUi();
+    AppendLogMessage(QStringLiteral("当前为 TCP 长连接复现界面；监听和发送模块尚待接入。"));
 
-    setWindowTitle(QStringLiteral("Qt 大文件多线程传输工具"));
+    setWindowTitle(QStringLiteral("TCP 长连接文件传输（复现中）"));
     resize(860, 640);
 }
 
@@ -91,21 +85,20 @@ void MainWidget::OnBrowseOutputDirectoryClicked()
 
 void MainWidget::OnStartReceiverClicked()
 {
-    m_pStartReceiverButton->setEnabled(false);
-    m_pStopReceiverButton->setEnabled(true);
-    //To do
+    // TODO: 接入可靠 TCP 接收管理器，监听成功后再更新按钮状态。
+    AppendLogMessage(QStringLiteral("TCP 长连接接收模块尚待复现。"));
 }
 
 void MainWidget::OnStopReceiverClicked()
 {
-    m_pStartReceiverButton->setEnabled(true);
-    m_pStopReceiverButton->setEnabled(false);
-    //To do
+    // TODO: 接入可靠 TCP 接收管理器，停止监听后更新按钮状态。
+    AppendLogMessage(QStringLiteral("TCP 长连接接收模块尚待复现。"));
 }
 
 void MainWidget::OnSendFileClicked()
 {
-    //To do
+    // TODO: 接入 ReliableSenderWorker，整次文件传输复用同一个 socket。
+    AppendLogMessage(QStringLiteral("TCP 长连接发送模块尚待复现。"));
 }
 
 void MainWidget::OnLogMessageAppended(const QString &strMessage)
@@ -117,7 +110,7 @@ void MainWidget::OnSendProgressChanged(int nCompletedChunkCount, int nTotalChunk
 {
     m_pSendProgressBar->setMaximum(qMax(1,nTotalChunkCount));
     m_pSendProgressBar->setValue(nCompletedChunkCount);
-    m_pSendProgressBar->setFormat(QStringLiteral("发送进度：%1 / %2 块").arg(nCompletedChunkCount,nTotalChunkCount));
+    m_pSendProgressBar->setFormat(QStringLiteral("发送进度：%1 / %2 分片").arg(nCompletedChunkCount).arg(nTotalChunkCount));
 }
 
 void MainWidget::OnSendFinished(bool bSuccess, const QString &strMessage)
@@ -132,23 +125,9 @@ void MainWidget::OnSendFinished(bool bSuccess, const QString &strMessage)
     }
 }
 
-void MainWidget::OnTransferModeChanged(int nCurrentIndex)
-{
-    Q_UNUSED(nCurrentIndex) // 表示：这个参数虽然传进来了，但函数里故意不使用它。
-//    它主要用于消除编译器的“未使用参数”警告，效果近似：
-//    (void)nCurrentIndex;
-//    这里槽函数必须接收 currentIndexChanged(int) 信号传来的索引，才能匹配信号：
-//    connect(m_pModeComboBox,
-//            QOverload<int>::of(&QComboBox::currentIndexChanged),
-//            this,
-//            &MainWidget::OnTransferModeChanged);
-//    但实际逻辑不直接依赖这个 nCurrentIndex，而是在 UpdateModeSpecificUi() 内重新读取当前选择：
-    UpdateModeSpecificUi();
-}
-
 void MainWidget::OnReceiveProgressChanged(const QString &strFileName, int nCompletedChunkCount, int nTotalChunkCount)
 {
-    m_pReceiveStatusLabel->setText(QStringLiteral("接收中:%1,已完成 %2 / %3 块").arg(strFileName,nCompletedChunkCount,nTotalChunkCount));
+    m_pReceiveStatusLabel->setText(QStringLiteral("接收中:%1,已完成 %2 / %3 分片").arg(strFileName).arg(nCompletedChunkCount).arg(nTotalChunkCount));
 }
 
 void MainWidget::OnReceiveFinished(const QString &strFilePath)
@@ -165,11 +144,7 @@ void MainWidget::InitializeUI()
     QGroupBox *pConfigurationGroupBox = new QGroupBox(QStringLiteral("传输配置"),this);//一个分组布局
     QFormLayout *pConfigurationFormLayout = new QFormLayout(pConfigurationGroupBox);//表单布局
 
-    m_pModeComboBox = new QComboBox(this);
-    m_pModeComboBox->addItem(QStringLiteral("TCP"),static_cast<int>(ETransferMode::TcpMode));
-    m_pModeComboBox->addItem(QStringLiteral("UDP"),static_cast<int>(ETransferMode::UdpMode));
-
-    m_pBindIpLineEdit = new QLineEdit(QString("127.0.0.1"),this);
+    m_pBindIpLineEdit = new QLineEdit(QString("0.0.0.0"),this);
     m_pTargetIpLineEdit = new QLineEdit(QString("127.0.0.1"),this);
 
     m_pListenPortSpinBox = new NoWheelSpinBox(this);
@@ -178,39 +153,24 @@ void MainWidget::InitializeUI()
 
     m_pSendPortSpinBox = new NoWheelSpinBox(this);
     m_pSendPortSpinBox->setRange(1024,65535);
-    m_pSendPortSpinBox->setValue(8890);
+    m_pSendPortSpinBox->setValue(8899);
 
     m_pThreadCountSpinBox = new NoWheelSpinBox(this);
     m_pThreadCountSpinBox->setRange(1, 32);
-    m_pThreadCountSpinBox->setValue(g_nDefaultThreadCount);
-
-    m_pChunkSizeSpinBox = new NoWheelSpinBox(this);
-    m_pChunkSizeSpinBox->setRange(1, 4096);
-    m_pChunkSizeSpinBox->setValue(4);
+    m_pThreadCountSpinBox->setValue(g_nDefaultSendWindowSize);
+    m_pThreadCountSpinBox->setToolTip(QStringLiteral("允许同时已发送但未收到 ACK 的分片数。"));
 
     m_pSegmentSizeSpinBox = new NoWheelSpinBox(this);
     m_pSegmentSizeSpinBox->setRange(1, 4096);
-    m_pSegmentSizeSpinBox->setValue(4);
-
-    m_pChunkUnitComboBox = new QComboBox(this);
-    m_pChunkUnitComboBox->addItem(QStringLiteral("KB"), 1024);//addItem(显示文本, 附加数据) 的第二个参数存的是单位换算倍率
-    m_pChunkUnitComboBox->addItem(QStringLiteral("MB"), 1024 * 1024);
-    m_pChunkUnitComboBox->setCurrentIndex(1);
+    m_pSegmentSizeSpinBox->setValue(g_nDefaultSegmentSize / 1024);
 
     m_pSegmentUnitComboBox = new QComboBox(this);
     m_pSegmentUnitComboBox->addItem(QStringLiteral("KB"), 1024);
     m_pSegmentUnitComboBox->addItem(QStringLiteral("MB"), 1024 * 1024);
-    m_pSegmentUnitComboBox->setCurrentIndex(1);
+    m_pSegmentUnitComboBox->setCurrentIndex(0);
 
-    m_pThreadCountLabel = new QLabel(this);
-    m_pChunkSizeLabel = new QLabel(this);
-    m_pSegmentSizeLabel = new QLabel(this);
-
-    QWidget *pChunkSizeWidget = new QWidget(this);
-    QHBoxLayout *pChunkSizeLayout = new QHBoxLayout(pChunkSizeWidget);
-    pChunkSizeLayout->setContentsMargins(0,0,0,0);//是设置布局四周的内边距为 0。
-    pChunkSizeLayout->addWidget(m_pChunkSizeSpinBox);
-    pChunkSizeLayout->addWidget(m_pChunkUnitComboBox);
+    m_pThreadCountLabel = new QLabel(QStringLiteral("发送窗口"), this);
+    m_pSegmentSizeLabel = new QLabel(QStringLiteral("分片大小"), this);
 
     QWidget *pSegmentSizeWidget = new QWidget(this);
     QHBoxLayout *pSegmentSizeLayout = new QHBoxLayout(pSegmentSizeWidget);
@@ -242,13 +202,12 @@ void MainWidget::InitializeUI()
     pOutputLayout->addWidget(m_pOutputDirectoryLineEdit);
     pOutputLayout->addWidget(pBrowseOutputButton);
 
-    pConfigurationFormLayout->addRow(QStringLiteral("传输模式"), m_pModeComboBox);
+    pConfigurationFormLayout->addRow(QStringLiteral("传输协议"), new QLabel(QStringLiteral("TCP 长连接（待接入）"), this));
     pConfigurationFormLayout->addRow(QStringLiteral("监听 IP"), m_pBindIpLineEdit);
     pConfigurationFormLayout->addRow(QStringLiteral("目标 IP"), m_pTargetIpLineEdit);
     pConfigurationFormLayout->addRow(QStringLiteral("接收端端口"), m_pListenPortSpinBox);
-    pConfigurationFormLayout->addRow(QStringLiteral("发送端端口"), m_pSendPortSpinBox);
+    pConfigurationFormLayout->addRow(QStringLiteral("目标接收端端口"), m_pSendPortSpinBox);
     pConfigurationFormLayout->addRow(m_pThreadCountLabel, m_pThreadCountSpinBox);
-    pConfigurationFormLayout->addRow(m_pChunkSizeLabel, pChunkSizeWidget);
     pConfigurationFormLayout->addRow(m_pSegmentSizeLabel, pSegmentSizeWidget);
     pConfigurationFormLayout->addRow(QStringLiteral("发送文件"), pFileWidget);
     pConfigurationFormLayout->addRow(QStringLiteral("接收目录"), pOutputWidget);
@@ -271,7 +230,7 @@ void MainWidget::InitializeUI()
     m_pSendProgressBar->setMinimum(0);
     m_pSendProgressBar->setMaximum(1);
     m_pSendProgressBar->setValue(0);
-    m_pSendProgressBar->setFormat(QStringLiteral("发送进度：0 / 0 块"));
+    m_pSendProgressBar->setFormat(QStringLiteral("发送进度：0 / 0 分片"));
 
     m_pReceiveStatusLabel = new QLabel(QStringLiteral("接收状态：等待任务"), this);
     m_pReceiveStatusLabel->setObjectName(QStringLiteral("ReceiveStatusLabel"));//给控件起对象名，这样方便qss
@@ -290,49 +249,10 @@ void MainWidget::InitializeUI()
     pMainLayout->addWidget(pLogGroupBox);
 }
 
-/**
- * @brief MainWidget::GetCurrentTransferMode
- * @param 无
- * @return 当前界面选择的传输模式。
- * @details 读取下拉框中保存的枚举值并转成内部模式。
- */
-ETransferMode MainWidget::GetCurrentTransferMode() const
-{
-    return static_cast<ETransferMode>(m_pModeComboBox->currentData().toInt());
-}
-
-void MainWidget::UpdateModeSpecificUi()
-{
-    const bool bIsTcpMode = (GetCurrentTransferMode() == ETransferMode::TcpMode);
-    m_pThreadCountLabel->setText(bIsTcpMode ? QStringLiteral("发送窗口") : QStringLiteral("线程数"));
-    m_pChunkSizeLabel->setText(bIsTcpMode ? QStringLiteral("块大小（仅 UDP）") : QStringLiteral("块大小"));
-    m_pSegmentSizeLabel->setText(QStringLiteral("分片大小"));
-
-
-    m_pChunkSizeSpinBox->setEnabled(!bIsTcpMode); //不是TCP时才可以选择
-    m_pChunkUnitComboBox->setEnabled(!bIsTcpMode);
-
-
-    m_pThreadCountSpinBox->setToolTip(bIsTcpMode
-                                          ? QStringLiteral("TCP 长连接可靠模式下表示发送窗口大小。")
-                                          : QStringLiteral("UDP 模式下表示 Qt 线程池并发数。"));
-    m_pChunkSizeSpinBox->setToolTip(bIsTcpMode
-                                        ? QStringLiteral("TCP 长连接可靠模式不使用短连接块发送。")
-                                        : QStringLiteral("UDP 模式下控制每个任务负责的块大小。"));
-    m_pChunkUnitComboBox->setToolTip(m_pChunkSizeLabel->toolTip());
-    m_pSegmentSizeSpinBox->setToolTip(QStringLiteral("控制单个网络分片大小，可选择 KB 或 MB。"));
-    m_pSegmentUnitComboBox->setToolTip(m_pSegmentSizeSpinBox->toolTip());
-}
-
 void MainWidget::UpdateReceiverButtons(bool bListening)
 {
     m_pStartReceiverButton->setEnabled(!bListening);
     m_pStopReceiverButton->setEnabled(bListening);
-}
-
-qint64 MainWidget::GetChunkSizeBytes() const
-{
-    return static_cast<int>(static_cast<qint64>(m_pChunkSizeSpinBox->value()) * GetSizeUnitMultiplier(m_pChunkUnitComboBox));
 }
 
 int MainWidget::GetSegmentSizeBytes() const

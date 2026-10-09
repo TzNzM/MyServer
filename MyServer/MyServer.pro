@@ -16,20 +16,14 @@ DEFINES += QT_DEPRECATED_WARNINGS
 #DEFINES += QT_DISABLE_DEPRECATED_BEFORE=0x060000    # disables all the APIs deprecated before Qt 6.0.0
 
 SOURCES += \
-    abstracttransferchannel.cpp \
     mainwidget.cpp \
     nowheelspinbox.cpp \
-    main.cpp \
-    packetcodec.cpp \
-    tcptransferchannel.cpp
+    main.cpp
 
 HEADERS += \
-    abstracttransferchannel.h \
     mainwidget.h \
     nowheelspinbox.h \
-    packetcodec.h \
-    tcptransferchannel.h \
-    transfertypes.h
+    transferdefaults.h
 
 FORMS += \
     mainwidget.ui
