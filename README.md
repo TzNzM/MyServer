@@ -4,7 +4,7 @@
 
 ## 分支
 
-- `archive/current-scaffold`：保留清理前的源码、学习注释、旧协议和短连接原型。
+- `archive/unfinished-udp-tcp-short`：保留清理前的源码和学习注释；UDP 与 TCP 短连接部分尚未完成。
 - `main`：仅面向可靠 TCP 长连接的复现主线。
 
 ## 当前进度
