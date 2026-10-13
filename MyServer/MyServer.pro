@@ -16,11 +16,14 @@ DEFINES += QT_DEPRECATED_WARNINGS
 #DEFINES += QT_DISABLE_DEPRECATED_BEFORE=0x060000    # disables all the APIs deprecated before Qt 6.0.0
 
 SOURCES += \
+    ReliablePacketCodec.cpp \
     mainwidget.cpp \
     nowheelspinbox.cpp \
     main.cpp
 
 HEADERS += \
+    ReliablePacketCodec.h \
+    ReliableTransferTypes.h \
     mainwidget.h \
     nowheelspinbox.h \
     transferdefaults.h
