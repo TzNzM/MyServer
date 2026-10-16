@@ -17,12 +17,16 @@ DEFINES += QT_DEPRECATED_WARNINGS
 
 SOURCES += \
     ReliablePacketCodec.cpp \
+    ReliableSenderWorker.cpp \
+    ReliableTransferManager.cpp \
     mainwidget.cpp \
     nowheelspinbox.cpp \
     main.cpp
 
 HEADERS += \
     ReliablePacketCodec.h \
+    ReliableSenderWorker.h \
+    ReliableTransferManager.h \
     ReliableTransferTypes.h \
     mainwidget.h \
     nowheelspinbox.h \
