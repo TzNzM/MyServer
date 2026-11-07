@@ -1,584 +1,342 @@
 #include "ReliableTransferManager.h"
 
-#include "ReliablePacketCodec.h"
+#include "ReliableReceiveSessionStore.h"
+#include "ReliableReceiverWorker.h"
+#include "ReliableTcpServer.h"
+#include "ReliableSenderWorker.h"
 
-#include <QCryptographicHash>
-#include <QDataStream>
-#include <QDir>
-#include <QFile>
 #include <QFileInfo>
+#include <QDir>
 #include <QHostAddress>
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QTcpServer>
+#include <QPointer>
 #include <QTcpSocket>
 #include <QThread>
 
 ReliableTransferManager::ReliableTransferManager(QObject *pParent)
     : QObject(pParent),
       m_strOutputDirectory(QDir::currentPath()),
-      m_pTcpServer(new QTcpServer(this)),
-      m_mapReceiverBuffer(),
-      m_mapReceiverSession(),
+      m_pTcpServer(new ReliableTcpServer(this)),
+      m_pSessionStore(),
+      m_arrReceiverThreads(),
+      m_mapReceiveProgress(),
+      m_setCompletedSessions(),
       m_pSenderThread(nullptr),
       m_pReliableSenderWorker(nullptr)
 {
-    connect(m_pTcpServer,&QTcpServer::newConnection,this,&ReliableTransferManager::OnNewConnection);
+    //注册类型名称，供涉及该类型的跨线程队列传递使用。
+     qRegisterMetaType<qintptr>("qintptr");
+
+    //监听对象只负责交出连接描述符，
+    //由 Manager 创建接收线程和 Worker。
+    connect(m_pTcpServer,&ReliableTcpServer::SignalConnectionAccepted,this,&ReliableTransferManager::OnIncomingConnection);
 }
 
 ReliableTransferManager::~ReliableTransferManager()
 {
+    StopSending();
     StopListening();
-
-    if(m_pSenderThread != nullptr)//如果当前的传送的线程没有关闭
-    {
-        m_pSenderThread->quit();
-        m_pSenderThread->wait();
-        delete m_pSenderThread;
-        m_pSenderThread = nullptr;
-        m_pReliableSenderWorker = nullptr;
-    }
 }
 
 void ReliableTransferManager::SetOutputDirectory(const QString &strOutputDirectory)
 {
     if(!strOutputDirectory.isEmpty())
     {
-        m_strOutputDirectory = strOutputDirectory;
+        m_strOutputDirectory = QDir(strOutputDirectory).absolutePath();
     }
 }
 
 bool ReliableTransferManager::StartListening(const QString &strBindIp, int nPort, QString &strErrorMessage)
 {
-    QHostAddress oBindAddress;
-    const QString strEffectiveBindIp = strBindIp.trimmed().isEmpty() ? QStringLiteral("0.0.0.0") : strBindIp.trimmed();
-    if(!oBindAddress.setAddress(strEffectiveBindIp)){
-        strErrorMessage = QStringLiteral("监听 IP 非法：%1").arg(strBindIp);
+    //第一段：检查端口和监听地址。
+    if (nPort < 1 || nPort > 65535)
+    {
+        strErrorMessage = QStringLiteral("监听端口必须在 1～65535 之间。");
         return false;
     }
 
-    StopListening();//这里是为了防止之前的没有断干净
+    const QString strEffectiveBindIp =
+        strBindIp.trimmed().isEmpty()
+            ? QStringLiteral("0.0.0.0")
+            : strBindIp.trimmed();
+
+    QHostAddress oBindAddress;
+
+    if(!oBindAddress.setAddress(strEffectiveBindIp))
+    {
+        strErrorMessage =
+            QStringLiteral("监听 IP 非法：%1").arg(strBindIp);
+        return false;
+    }
+
+    //第二段：停止上一轮监听，等待旧接收线程退出。
+    StopListening();
+
+    //第三段：为本轮监听创建新的共享会话管理对象。
+    m_pSessionStore.reset(new ReliableReceiveSessionStore(m_strOutputDirectory));
+
+    //第四段：启动监听；失败时清理刚创建的本轮状态。
     if(!m_pTcpServer->listen(oBindAddress,static_cast<quint16>(nPort)))
     {
         strErrorMessage = m_pTcpServer->errorString();
+
+        StopListening();
         return false;
     }
 
-    emit SignalLogMessage(QStringLiteral("[TCP-Reliable] 已开始监听 %1:%2")
-                          .arg(oBindAddress.toString())
-                          .arg(nPort));
+    emit SignalLogMessage(
+            QStringLiteral("[TCP-Reliable] 已开始监听 %1:%2")
+                .arg(oBindAddress.toString())
+                .arg(nPort));
+
     return true;
+
 }
 
 void ReliableTransferManager::StopListening()
 {
-    const QList<QTcpSocket*> arrSocketList = m_mapReceiverBuffer.keys();//获取当前仍在缓存区中的socket
-    for(QTcpSocket* pSocket : arrSocketList)
+    //第一段：使上一轮监听产生的排队进度、完成通知失效。
+    ++m_nReceiverGeneration;
+
+    //关闭监听端口，停止接受新连接。
+    //已经建立的连接由各接收线程中的 Worker 清理。
+    m_pTcpServer->close();
+
+    //第二段：通过共享停止标记，通知接收和合并过程退出。
+    if (!m_pSessionStore.isNull())
     {
-        if(pSocket != nullptr)
-        {
-            pSocket->disconnect();
-            pSocket->close();
-            pSocket->deleteLater();
-        }
+        m_pSessionStore->RequestStop();
     }
 
-    m_mapReceiverBuffer.clear();
-
-    //持久化当前内容（可能会有传输错误导致的失败，所以这里能够为后面的重传做准备）
-    for(SReceiverSessionState &stSessionState : m_mapReceiverSession)
+    //第三段：先向所有接收线程请求退出事件循环。
+    for(QThread* pThread : m_arrReceiverThreads)
     {
-        QString strIgnoreErrorMessage;
-        PersistSessionState(stSessionState,strIgnoreErrorMessage);
+        pThread->quit();
     }
 
-    if(m_pTcpServer->isListening())
+    //再逐个等待线程结束，最后释放 QThread 对象。
+    for (QThread *pThread : m_arrReceiverThreads)
     {
-        m_pTcpServer->close();
-    }
-}
-
-bool ReliableTransferManager::StartSend(const QString &strFilePath, const QString &strTargetIp, int nPort, int nWindowSize, int nSegmentSize, QString &strErrorMessage)
-{
-    //To do
-}
-
-void ReliableTransferManager::OnNewConnection()
-{
-    while (m_pTcpServer->hasPendingConnections())//只要还有等待取出的新连接，就继续处理
-    {
-        QTcpSocket* pSocket = m_pTcpServer->nextPendingConnection();
-        if(pSocket == nullptr)
-        {//表示这次没有取到有效的连接对象，无法继续对它操作
-            continue;
-        }
-
-        m_mapReceiverBuffer.insert(pSocket,QByteArray());
-        connect(pSocket,&QTcpSocket::readyRead,this,&ReliableTransferManager::OnSocketReadyRead);
-        connect(pSocket,&QTcpSocket::disconnected,this,&ReliableTransferManager::OnSocketDisconnected);
-        emit SignalLogMessage(QStringLiteral("[TCP-Reliable] 新连接：%1").arg(pSocket->peerAddress().toString()));
-    }
-}
-
-void ReliableTransferManager::OnSocketReadyRead()
-{
-    QTcpSocket *pSocket = qobject_cast<QTcpSocket *>(sender());//谁调用这个slots的
-    if(pSocket == nullptr || !m_mapReceiverBuffer.contains(pSocket))
-    {
-        //如果不存在，则返回
-        return;
+        pThread->wait();
+        delete pThread;
     }
 
-    QByteArray &arrReceiverBuffer = m_mapReceiverBuffer[pSocket];
-    arrReceiverBuffer.append(pSocket->readAll());//一次读所有
+    //第四段：线程全部退出后，清理本轮监听记录。
+    m_arrReceiverThreads.clear();
+    m_pSessionStore.clear();
 
-    while (arrReceiverBuffer.size() >= ReliablePacketCodec::GetHeaderLength())
-    {//如果剩下来的大于完整表头的长度
-        SReliablePacketHeader stPacketHeader;
-        QString strErrorMessage;
-        if(!ReliablePacketCodec::ParsePacketHeader(arrReceiverBuffer.left(ReliablePacketCodec::GetHeaderLength()),stPacketHeader,strErrorMessage))
-        {//如果解析失败，证明不是我们的包
-            emit SignalLogMessage(QStringLiteral("[TCP-Reliable] 包头解析失败：%1").arg(strErrorMessage));
-            pSocket->disconnectFromHost();
-            return;
-        }
-        const int nTotalPacketLength = ReliablePacketCodec::GetHeaderLength() + static_cast<int>(stPacketHeader.m_nPayloadSize);
-        if(arrReceiverBuffer.size() < nTotalPacketLength)
-        {
-            break;//如果现在这个包还没完整传过来，则结束
-        }
-        const QByteArray arrPayload = arrReceiverBuffer.mid(
-            ReliablePacketCodec::GetHeaderLength(),          // 从哪里开始取
-            static_cast<int>(stPacketHeader.m_nPayloadSize)  // 取多少字节
-        );//这一步是去取数据的
-        arrReceiverBuffer.remove(0,nTotalPacketLength);
-
-        switch (static_cast<EReliableMessageType>(stPacketHeader.m_nMessageType))
-        {
-        case EReliableMessageType::MetadataPacket:
-                HandleMetadataPacket(pSocket,stPacketHeader,arrPayload);
-            break;
-        case EReliableMessageType::DataPacket:
-                HandleDataPacket(pSocket,stPacketHeader,arrPayload);
-            break;
-        case EReliableMessageType::CompleteRequestPacket:
-                HandleCompleteRequestPacket(pSocket, stPacketHeader);
-            break;
-        default:
-            break;
-        }
-    }
+    m_nNextConnectionIndex = 0;
+    m_mapReceiveProgress.clear();
+    m_setCompletedSessions.clear();
 
 }
 
-void ReliableTransferManager::OnSocketDisconnected()
+bool ReliableTransferManager::StartSend(const QString &strFilePath, const QString &strTargetIp, int nPort, int nThreadCount, int nWindowSize, int nSegmentSize, QString &strErrorMessage)
 {
-    //在槽函数里，找出本次发出信号的那个 socket，并把它转换成 QTcpSocket *。
-    //sender()能取得发出信号的对象。但它返回的是通用类型：QObject *
-    QTcpSocket *pSocket = qobject_cast<QTcpSocket *>(sender());
+    strErrorMessage.clear();
 
-    if(pSocket == nullptr)
+    //第一段：一个 Manager 同时只管理一个文件发送任务。
+    if(m_pSenderThread != nullptr && m_pSenderThread->isRunning())
     {
-        return;
-    }
-
-    //持久化操作
-    for(SReceiverSessionState &stSessionState : m_mapReceiverSession){
-        QString strIgnoreErrorMessage;
-        PersistSessionState(stSessionState, strIgnoreErrorMessage);
-    }
-
-    m_mapReceiverBuffer.remove(pSocket);
-    pSocket->deleteLater();
-}
-
-void ReliableTransferManager::HandleMetadataPacket(QTcpSocket *pSocket, const SReliablePacketHeader &stPacketHeader, const QByteArray &arrPayload)
-{
-    QString strErrorMessage;
-    SReliableFileMetadata stMetadata;
-    if(!ReliablePacketCodec::ParseMetadataPayload(arrPayload,stMetadata,strErrorMessage)){
-        const QByteArray arrErrorPacket = ReliablePacketCodec::BuildErrorPacket(SReliableFileMetadata(),QStringLiteral("元信息解析失败：%1").arg(strErrorMessage));
-        pSocket->write(arrErrorPacket);
-        pSocket->waitForBytesWritten(g_nReliableControlWaitTimeoutMs);
-        emit SignalLogMessage(QStringLiteral("[TCP-Reliable] 元信息解析失败：%1").arg(strErrorMessage));
-        return;
-    }
-
-    stMetadata.m_oTransferId = stPacketHeader.m_oTransferId;
-
-    SReceiverSessionState stSessionState;
-    if(!LoadOrCreateSession(stMetadata,stSessionState,strErrorMessage))
-    {//如果创建失败
-        const QByteArray arrErrorPacket = ReliablePacketCodec::BuildErrorPacket(stMetadata,strErrorMessage);
-        pSocket->write(arrErrorPacket);
-        pSocket->waitForBytesWritten(g_nReliableControlWaitTimeoutMs);
-        emit SignalLogMessage(QStringLiteral("[TCP-Reliable] 会话恢复失败：%1").arg(strErrorMessage));
-        return;
-    }
-
-    m_mapReceiverSession[stMetadata.m_oTransferId] = stSessionState;
-    const QList<SReliablePacketRange> arrMissingRangeList = BuildMissingRanges(stSessionState);
-    const QByteArray arrResumeStatePacket = ReliablePacketCodec::BuildResumeStatePacket(stSessionState.m_stMetadata,arrMissingRangeList,stSessionState.m_nReceivedPacketCount);//如果是新文件就是全没发过
-    pSocket->write(arrResumeStatePacket);
-    pSocket->waitForBytesWritten(g_nReliableControlWaitTimeoutMs);
-
-    emit SignalLogMessage(QStringLiteral("[TCP-Reliable] 会话已准备完成：%1，缺失范围数：%2")
-                              .arg(stMetadata.m_strFileName)
-                              .arg(arrMissingRangeList.size()));
-
-}
-
-void ReliableTransferManager::HandleDataPacket(QTcpSocket *pSocket, const SReliablePacketHeader &stPacketHeader, const QByteArray &arrPayload)
-{
-    if(!m_mapReceiverSession.contains(stPacketHeader.m_oTransferId))
-    {//接收到未知的分片
-        SReliableFileMetadata stMetadata;
-        stMetadata.m_oTransferId = stPacketHeader.m_oTransferId;
-        const QByteArray arrErrorPacket = ReliablePacketCodec::BuildErrorPacket(stMetadata,QStringLiteral("收到未知会话分片。"));
-        pSocket->write(arrErrorPacket);
-        pSocket->waitForBytesWritten(g_nReliableControlWaitTimeoutMs);
-        emit SignalLogMessage(QStringLiteral("[TCP-Reliable] 收到未知会话分片。"));
-        return;
-    }
-
-    QString strErrorMessage;
-    SReceiverSessionState &stSessionState = m_mapReceiverSession[stPacketHeader.m_oTransferId]; //因为后面需要直接修改 m_mapReceiverSession 中保存的会话状态，所以这里取引用
-    const int nPacketIndex = static_cast<int>(stPacketHeader.m_nPacketSequence);
-
-    if(nPacketIndex < 0 || nPacketIndex >= stSessionState.m_oReceivedPacketMap.size())
-    {
-        const QByteArray arrErrorPacket = ReliablePacketCodec::BuildErrorPacket(stSessionState.m_stMetadata,
-                                                                                QStringLiteral("分片序号越界：%1").arg(stPacketHeader.m_nPacketSequence));
-        pSocket->write(arrErrorPacket);
-        pSocket->waitForBytesWritten(g_nReliableControlWaitTimeoutMs);
-        emit SignalLogMessage(QStringLiteral("[TCP-Reliable] 分片序号越界：%1").arg(stPacketHeader.m_nPacketSequence));
-        return;
-    }
-
-    if(!stSessionState.m_oReceivedPacketMap.testBit(nPacketIndex))
-    {//这里接收到的是之前没接收到的分片的时候
-        QFile oPartFile(stSessionState.m_strPartFilePath);
-        if(!oPartFile.open(QIODevice::ReadWrite))
-        {//如果临时文件打不开
-            const QByteArray arrErrorPacket = ReliablePacketCodec::BuildErrorPacket(stSessionState.m_stMetadata,
-                                                                                    QStringLiteral("临时文件打开失败：%1").arg(oPartFile.errorString()));
-            pSocket->write(arrErrorPacket);
-            pSocket->waitForBytesWritten(g_nReliableAckPollIntervalMs);
-            emit SignalLogMessage(QStringLiteral("[TCP-Reliable] 临时文件打开失败：%1").arg(oPartFile.errorString()));
-            return;
-        }
-
-        if(!oPartFile.seek(static_cast<qint64>(stPacketHeader.m_nPayloadOffset)) ||
-            oPartFile.write(arrPayload) != arrPayload.size()) //这里已经进行了partfile文件的写入
-        {
-            const QByteArray arrErrorPacket = ReliablePacketCodec::BuildErrorPacket(stSessionState.m_stMetadata,
-                                                                                    QStringLiteral("分片写入失败。"));
-            pSocket->write(arrErrorPacket);
-            pSocket->waitForBytesWritten(g_nReliableControlWaitTimeoutMs);
-            emit SignalLogMessage(QStringLiteral("[TCP-Reliable] 分片写入失败。"));
-            return;
-        }
-
-        //做一些接收到该数据的逻辑调整
-        stSessionState.m_oReceivedPacketMap.setBit(nPacketIndex,true);
-        ++stSessionState.m_nReceivedPacketCount;
-        ++stSessionState.m_nUnsavedPacketCount;
-
-        if(stSessionState.m_nUnsavedPacketCount >= 32)
-        {
-            if(PersistSessionState(stSessionState,strErrorMessage))
-            {//做持久化数据状态的操作，防止多次操作，所以累计着操作
-                stSessionState.m_nUnsavedPacketCount = 0;
-            }else
-            {
-                emit SignalLogMessage(QStringLiteral("[TCP-Reliable] 状态保存失败：%1").arg(strErrorMessage));
-            }
-        }
-        //发送进度消息
-        emit SignalReceiveProgress(stSessionState.m_stMetadata.m_strFileName,static_cast<int>(stSessionState.m_nReceivedPacketCount),stSessionState.m_stMetadata.m_nTotalPacketCount);
-    }
-
-    const QByteArray arrAckPacket = ReliablePacketCodec::BuildAckPacket(stSessionState.m_stMetadata,stPacketHeader.m_nPacketSequence);
-
-    pSocket->write(arrAckPacket);
-    pSocket->waitForBytesWritten(g_nReliableControlWaitTimeoutMs);
-}
-
-void ReliableTransferManager::HandleCompleteRequestPacket(QTcpSocket *pSocket, const SReliablePacketHeader &stPacketHeader)
-{
-    if(!m_mapReceiverSession.contains(stPacketHeader.m_oTransferId))
-    {
-        SReliableFileMetadata stMetadata;
-        stMetadata.m_oTransferId = stPacketHeader.m_oTransferId;
-        const QByteArray arrErrorPacket = ReliablePacketCodec::BuildErrorPacket(stMetadata,
-                                                                                QStringLiteral("完成请求对应的会话不存在。"));
-        pSocket->write(arrErrorPacket);
-        pSocket->waitForBytesWritten(g_nReliableControlWaitTimeoutMs);
-        return;
-    }
-
-    QString strErrorMessage;
-    SReceiverSessionState &stSessionState = m_mapReceiverSession[stPacketHeader.m_oTransferId];
-    const QList<SReliablePacketRange> arrMissingRangeList = BuildMissingRanges(stSessionState);
-    if(!arrMissingRangeList.isEmpty())
-    {//还有一部分缺失
-        const QByteArray arrResultPacket = ReliablePacketCodec::BuildResultPacket(stSessionState.m_stMetadata,
-                                                                                  false,
-                                                                                  QStringLiteral("接收端仍有缺失分片。"),
-                                                                                  arrMissingRangeList);
-        pSocket->write(arrResultPacket);
-        pSocket->waitForBytesWritten(g_nReliableAckPollIntervalMs);
-        PersistSessionState(stSessionState, strErrorMessage);
-        return;
-    }
-
-    if(!VerifyAndFinalizeSession(stSessionState, strErrorMessage))
-    {//校验完整接收数据是否正确
-        const QByteArray arrResultPacket = ReliablePacketCodec::BuildResultPacket(stSessionState.m_stMetadata,
-                                                                                  false,
-                                                                                  strErrorMessage,
-                                                                                  QList<SReliablePacketRange>());
-        pSocket->write(arrResultPacket);
-        pSocket->waitForBytesWritten(g_nReliableAckPollIntervalMs);
-        PersistSessionState(stSessionState, strErrorMessage);
-        return;
-    }
-
-    const QByteArray arrResultPacket = ReliablePacketCodec::BuildResultPacket(stSessionState.m_stMetadata,
-                                                                              true,
-                                                                              QStringLiteral("文件接收、校验与落盘完成。"),
-                                                                              QList<SReliablePacketRange>());
-    pSocket->write(arrResultPacket);
-    pSocket->waitForBytesWritten(g_nReliableAckPollIntervalMs);
-    emit SignalReceiveFinished(stSessionState.m_strFinalFilePath);
-    emit SignalLogMessage(QStringLiteral("[TCP-Reliable] 文件接收完成：%1").arg(stSessionState.m_strFinalFilePath));
-    m_mapReceiverSession.remove(stPacketHeader.m_oTransferId);//当前文件任务已完成故而移除
-}
-
-bool ReliableTransferManager::VerifyAndFinalizeSession(ReliableTransferManager::SReceiverSessionState &stSessionState, QString &strErrorMessage)
-{
-    QFile oPartFile(stSessionState.m_strPartFilePath);
-    if(!oPartFile.open(QIODevice::ReadOnly))
-    {
-        strErrorMessage = QStringLiteral("临时文件打开失败：%1").arg(oPartFile.errorString());
+        strErrorMessage = QStringLiteral("当前已有文件发送任务。");
         return false;
     }
 
-    QCryptographicHash oMd5Hash(QCryptographicHash::Md5);
-    QCryptographicHash oShaHash(QCryptographicHash::Sha256);
+    //第二段：进行启动前的基本检查。
+    //文件读取、SHA-256 计算等耗时操作仍由后台 Worker 执行。
+    const QFileInfo oFileInfo(strFilePath);
+    QHostAddress oTargetAddress;
 
-    while (!oPartFile.atEnd())
+    if (!oFileInfo.isFile() ||
+        !oTargetAddress.setAddress(strTargetIp.trimmed()) ||
+        nPort < 1 || nPort > 65535 ||
+        nThreadCount < 1 ||
+        nThreadCount > g_nReliableMaxThreadCount ||
+        nWindowSize < 1 ||
+        nWindowSize > g_nReliableMaxWindowSize ||
+        nSegmentSize <= 0 ||
+        nSegmentSize > g_nReliableMaxSegmentSize)
     {
-        const QByteArray arrBuffer = oPartFile.read(1024 * 1024);
-        oMd5Hash.addData(arrBuffer);
-        oShaHash.addData(arrBuffer);
-    }
-
-    const QString strCalculatedMd5 = QString::fromLatin1(oMd5Hash.result().toHex());
-    const QString strCalculatedSha = QString::fromLatin1(oShaHash.result().toHex());
-    if (strCalculatedMd5.compare(stSessionState.m_stMetadata.m_strMd5, Qt::CaseInsensitive) != 0 ||
-        strCalculatedSha.compare(stSessionState.m_stMetadata.m_strSha256, Qt::CaseInsensitive) != 0)
-    {
-        strErrorMessage = QStringLiteral("接收端文件校验失败，MD5 或 SHA256 不匹配。");
-        PersistSessionState(stSessionState, strErrorMessage);
-        return false;
-    }
-    //校验成功之后，开始真正处理文件
-    oPartFile.close();
-    stSessionState.m_strFinalFilePath = BuildAvailableFilePath(stSessionState.m_strFinalFilePath);
-    if(stSessionState.m_strFinalFilePath.isEmpty())
-    {
-        strErrorMessage = QStringLiteral("无法生成可用文件路径：重名候选已耗尽。");
+        strErrorMessage =
+            QStringLiteral(
+                "源文件、目标地址、端口、线程数、发送窗口或分片大小非法。");
         return false;
     }
 
-    if(!QFile::rename(stSessionState.m_strPartFilePath,stSessionState.m_strFinalFilePath))
-    {
-        strErrorMessage = QStringLiteral("最终文件生成失败。");
-        return false;
-    }
+    //第三段：回收上一任务结束后保留的协调线程对象。
+    StopSending();
 
-    QFile::remove(stSessionState.m_strStateFilePath);
-    QDir(stSessionState.m_strSessionDirectory).removeRecursively();//递归删除 stSessionState.m_strSessionDirectory 指定的目录及其内部所有文件和子目录。
-    stSessionState.m_bCompleted = true;
+    m_pSenderThread = new QThread(this);
+    m_pSenderThread->setObjectName(QStringLiteral("sender-coordinator"));
+
+    m_pReliableSenderWorker = new ReliableSenderWorker;
+    ReliableSenderWorker *pWorker = m_pReliableSenderWorker;
+
+    pWorker->moveToThread(m_pSenderThread);
+
+    //第四段：转发 Worker 的日志、进度和最终结果。
+    connect(
+            pWorker, &ReliableSenderWorker::SignalLogMessage,
+            this, &ReliableTransferManager::SignalLogMessage);
+    connect(
+            pWorker, &ReliableSenderWorker::SignalSendProgress,
+            this, &ReliableTransferManager::SignalSendProgress);
+    connect(
+            pWorker, &ReliableSenderWorker::SignalSendFinished,
+            this, &ReliableTransferManager::SignalSendFinished);
+
+    //第五段：任务结束后，请求协调线程退出。
+    //quit() 是线程安全的，直接调用可避免退出请求等待主线程处理。
+    connect(
+        pWorker, &ReliableSenderWorker::SignalSendFinished,
+        m_pSenderThread, &QThread::quit,
+        Qt::DirectConnection);
+
+    //线程结束时，在所属线程中安排释放 Worker。
+    connect(
+            m_pSenderThread, &QThread::finished,
+            pWorker, &QObject::deleteLater);
+
+    //第六段：在线程启动后，由后台 Worker 执行发送流程。
+    //按值捕获参数，避免 StartSend 返回后引用失效。
+    const QString strAbsoluteFilePath = oFileInfo.absoluteFilePath();
+    const QString strEffectiveTargetIp = oTargetAddress.toString();
+
+    connect(m_pSenderThread,&QThread::started,pWorker,[pWorker,
+            strAbsoluteFilePath,
+            strEffectiveTargetIp,
+            nPort,
+            nThreadCount,
+            nWindowSize,
+            nSegmentSize]()
+    {
+        pWorker->ProcessSend(strAbsoluteFilePath,
+                             strEffectiveTargetIp,
+                             nPort,
+                             nThreadCount,
+                             nWindowSize,
+                             nSegmentSize);
+    });
+
+    m_pSenderThread->start();
+
+    //仅表示已发起后台任务，最终结果通过信号通知。
     return true;
 }
 
-bool ReliableTransferManager::LoadOrCreateSession(const SReliableFileMetadata &stMetadata, ReliableTransferManager::SReceiverSessionState &stSessionState, QString &strErrorMessage)
+
+void ReliableTransferManager::StopSending()
 {
-    QDir oOutputDirectory(m_strOutputDirectory);
-    if(!oOutputDirectory.exists() && !oOutputDirectory.mkpath(QStringLiteral("."))){//确保输出目录存在，如果不存在就创建它,"."：指 oOutputDirectory 自己表示的目录
-        strErrorMessage =  QStringLiteral("输出目录创建失败：%1").arg(m_strOutputDirectory);
-        return false;
-    }
-
-    //这里只是在构建文件地址，并未真正开始创建文件
-    stSessionState.m_stMetadata = stMetadata;
-    stSessionState.m_strSessionDirectory = oOutputDirectory.filePath("session_%1").arg(stMetadata.m_strSessionKey.left(16));//以sessionKey来命名的文件夹
-    stSessionState.m_strStateFilePath = QDir(stSessionState.m_strSessionDirectory).filePath(QStringLiteral("state.json"));
-    stSessionState.m_strPartFilePath = QDir(stSessionState.m_strSessionDirectory).filePath(QStringLiteral("payload.part"));
-
-    if(!QDir().mkpath(stSessionState.m_strSessionDirectory)){
-        strErrorMessage = QStringLiteral("会话目录创建失败：%1").arg(stSessionState.m_strSessionDirectory);
-        return false;
-    }
-
-    if(QFileInfo::exists(stSessionState.m_strStateFilePath))
-    {//如果存在，证明这里是断点重续(或者已经传输完毕)
-        QFile oStateFile(stSessionState.m_strStateFilePath);
-        if(!oStateFile.open(QIODevice::ReadOnly)){
-            strErrorMessage = QStringLiteral("状态文件打开失败：%1").arg(oStateFile.errorString());
-            return false;
-        }
-        const QJsonDocument oJsonDocument = QJsonDocument::fromJson(oStateFile.readAll());
-        const QJsonObject oJsonObject = oJsonDocument.object();
-        const qint64 nStateFileSize = oJsonObject.value(QStringLiteral("fileSize")).toString().toLongLong();
-        const int nStateSegmentSize = oJsonObject.value(QStringLiteral("segmentSize")).toInt();
-        const quint32 nStatePacketCount = static_cast<quint32>(oJsonObject.value(QStringLiteral("totalPacketCount")).toInt());
-        const QString strStateMd5 = oJsonObject.value(QStringLiteral("md5")).toString();
-        const QString strStateSha256 = oJsonObject.value(QStringLiteral("sha256")).toString();
-        // 判断能不能进行断点重续
-        const bool bCanResume = QFileInfo::exists(stSessionState.m_strPartFilePath) &&
-                                nStateFileSize == stMetadata.m_nFileSize &&
-                                nStateSegmentSize == stMetadata.m_nSegmentSize &&
-                                nStatePacketCount == stMetadata.m_nTotalPacketCount &&
-                                strStateMd5.compare(stMetadata.m_strMd5,Qt::CaseInsensitive) == 0 && //忽略字母大小写进行比较
-                                strStateSha256.compare(stMetadata.m_strSha256, Qt::CaseInsensitive) == 0;
-        if(bCanResume){//断点重续的必要数据的填写
-            stSessionState.m_strFinalFilePath = oJsonObject.value(QStringLiteral("finalFilePath")).toString();
-            stSessionState.m_oReceivedPacketMap = DecodeBitArray(oJsonObject.value(QStringLiteral("receivedPacketBitmap")).toString(),static_cast<int>(stMetadata.m_nTotalPacketCount));
-            stSessionState.m_nReceivedPacketCount = static_cast<quint32>(CountTrueBits(stSessionState.m_oReceivedPacketMap));
-            stSessionState.m_stMetadata.m_oTransferId = stMetadata.m_oTransferId;
-            stSessionState.m_stMetadata.m_nFileSize = stMetadata.m_nFileSize;
-            stSessionState.m_stMetadata.m_nSegmentSize = stMetadata.m_nSegmentSize;
-            stSessionState.m_stMetadata.m_nTotalPacketCount = stMetadata.m_nTotalPacketCount;
-            stSessionState.m_stMetadata.m_strMd5 = stMetadata.m_strMd5;
-            stSessionState.m_stMetadata.m_strSha256 = stMetadata.m_strSha256;
-            stSessionState.m_stMetadata.m_strFileName = stMetadata.m_strFileName;
-            stSessionState.m_stMetadata.m_strSessionKey = stMetadata.m_strSessionKey;
-            return true;
-        }
-
-        //如果对不上的话，就证明原来的这些文件没用了，直接删除掉了
-        QFile::remove(stSessionState.m_strStateFilePath);
-        QFile::remove(stSessionState.m_strPartFilePath);
-    }
-    //这里就是直接创建的时候要做的事情了
-    const QString strAvailablePath  = BuildAvailableFilePath(oOutputDirectory.filePath(stMetadata.m_strFileName));
-    if(strAvailablePath.isEmpty())
+    //第一段：尚未创建发送线程，无需清理。
+    if (m_pSenderThread == nullptr)
     {
-        strErrorMessage = QStringLiteral("无法生成可用文件路径：重名候选已耗尽。");
-        return false;
-    }
-    stSessionState.m_strFinalFilePath = strAvailablePath;
-    stSessionState.m_oReceivedPacketMap.resize(static_cast<int>(stMetadata.m_nTotalPacketCount));
-    stSessionState.m_oReceivedPacketMap.fill(false);
-
-    QFile oPartFile(stSessionState.m_strPartFilePath);
-    if(!oPartFile.open(QIODevice::ReadWrite)){
-        strErrorMessage = QStringLiteral("临时文件创建失败：%1").arg(oPartFile.errorString());
-        return false;
+        return;
     }
 
-    if(!oPartFile.resize(stMetadata.m_nFileSize)){//临时先预分配文件（防止过大分不下来）
-        strErrorMessage = QStringLiteral("临时文件预分配失败。");
-        return false;
-    }
-    return PersistSessionState(stSessionState,strErrorMessage);
+    //第二段：设置中断请求，供发送代码主动检查并退出。
+    //发出“请停止”的请求，发送代码主动检查后退出
+    m_pSenderThread->requestInterruption();
+
+    //请求发送线程的事件循环退出
+    m_pSenderThread->quit();
+
+    //第三段：等待发送工作及线程清理结束，再释放线程对象。
+    m_pSenderThread->wait();
+
+    delete m_pSenderThread;
+    m_pSenderThread = nullptr;
+    m_pReliableSenderWorker = nullptr;
 }
 
-bool ReliableTransferManager::PersistSessionState(const ReliableTransferManager::SReceiverSessionState &stSessionState, QString &strErrorMessage) const
+void ReliableTransferManager::OnIncomingConnection(qintptr nSocketDescriptor)
 {
-    QJsonObject oJsonObject;
-    oJsonObject.insert(QStringLiteral("sessionKey"), stSessionState.m_stMetadata.m_strSessionKey);
-    oJsonObject.insert(QStringLiteral("fileName"), stSessionState.m_stMetadata.m_strFileName);
-    oJsonObject.insert(QStringLiteral("fileSize"), QString::number(stSessionState.m_stMetadata.m_nFileSize));
-    oJsonObject.insert(QStringLiteral("segmentSize"), stSessionState.m_stMetadata.m_nSegmentSize);
-    oJsonObject.insert(QStringLiteral("totalPacketCount"), static_cast<int>(stSessionState.m_stMetadata.m_nTotalPacketCount));
-    oJsonObject.insert(QStringLiteral("md5"), stSessionState.m_stMetadata.m_strMd5);
-    oJsonObject.insert(QStringLiteral("sha256"), stSessionState.m_stMetadata.m_strSha256);
-    oJsonObject.insert(QStringLiteral("finalFilePath"), stSessionState.m_strFinalFilePath);
-    oJsonObject.insert(QStringLiteral("receivedPacketCount"), static_cast<int>(stSessionState.m_nReceivedPacketCount));
-    oJsonObject.insert(QStringLiteral("receivedPacketBitmap"), EncodeBitArray(stSessionState.m_oReceivedPacketMap));
-
-    QFile oStateFile(stSessionState.m_strStateFilePath);
-    if(!oStateFile.open(QIODevice::WriteOnly | QIODevice::Truncate)){//QIODevice::Truncate：清空原有内容
-        strErrorMessage =  QStringLiteral("状态文件写入失败：%1").arg(oStateFile.errorString());
-        return false;
-    }
-
-    oStateFile.write(QJsonDocument(oJsonObject).toJson(QJsonDocument::Compact));
-    return true;
-}
-
-QList<SReliablePacketRange> ReliableTransferManager::BuildMissingRanges(const ReliableTransferManager::SReceiverSessionState &stSessionState) const
-{
-    QList<SReliablePacketRange> arrMissingRangeList;
-    const int nBitCount = stSessionState.m_oReceivedPacketMap.size();
-
-    int nRangeStartIndex = -1;
-    for(int nIndex = 0; nIndex < nBitCount; ++nIndex)
+    //第一段：检查本轮监听状态及接收线程总数。
+    if (m_pSessionStore.isNull() ||
+            m_pSessionStore->IsStopping() ||
+            m_arrReceiverThreads.size() >= g_nReliableMaxReceiverThreadCount)
     {
-        const bool bReceived = stSessionState.m_oReceivedPacketMap.testBit(nIndex);
-        if(!bReceived && nRangeStartIndex < 0)
-        {//当没有收到时，且StartIndex还未赋值时
-            nRangeStartIndex = nIndex;
-        }else if (bReceived && nRangeStartIndex >= 0)
-        {//当第一次有收到时
-            arrMissingRangeList.append(SReliablePacketRange(static_cast<quint64>(nRangeStartIndex),static_cast<quint64>(nIndex - 1)));
-            nRangeStartIndex = -1;
+        //本连接不再交给 Worker，临时接管后立即关闭。
+        QTcpSocket oSocket;
+        oSocket.setSocketDescriptor(nSocketDescriptor);
+        oSocket.abort();
+        return;
+    }
+
+    //保存建立连接时的监听轮次，供后续过滤旧通知。
+    const quint64 nGeneration = m_nReceiverGeneration;
+
+    //第二段：创建接收线程及其工作对象。
+    QThread *pThread = new QThread(this);
+
+    pThread->setObjectName(QStringLiteral("receiver-connection-%1").arg(m_nNextConnectionIndex++));
+    ReliableReceiverWorker *pWorker = new ReliableReceiverWorker(m_pSessionStore);
+
+    //将 Worker 的线程归属改为新接收线程。
+    pWorker->moveToThread(pThread);
+
+    //第三段：线程启动后，由 Worker 在接收线程中接管连接。
+    connect(pThread,&QThread::started,pWorker,[pWorker,nSocketDescriptor](){pWorker->AcceptConnection(nSocketDescriptor);});
+    //线程结束时，在接收线程中安排释放 Worker。
+    connect(pThread,&QThread::finished,pWorker,&QObject::deleteLater);
+    //连接工作结束时，请求配套线程退出。 //quit() 是线程安全的，直接调用可避免退出请求排在主线程队列中。
+    connect(pWorker,&ReliableReceiverWorker::SignalWorkerFinished,pThread,&QThread::quit,Qt::DirectConnection);
+    //第四段：将 Worker 的日志转交给 Manager。
+    connect(pWorker,&ReliableReceiverWorker::SignalLogMessage,this,&ReliableTransferManager::SignalLogMessage);
+
+    //转发接收进度，过滤旧轮次通知，并避免进度倒退。
+    connect(pWorker,&ReliableReceiverWorker::SignalReceiveProgress,this,
+            [this,nGeneration](const QUuid &oTransferId, const QString &strFileName,int nCompletedPacketCount,int nTotalPacketCount)
+    {
+        //停止监听后，不再处理上一轮的进度通知。
+        //已经报告完成的任务，也不再更新进度。
+        if (nGeneration != m_nReceiverGeneration ||
+            m_setCompletedSessions.contains(oTransferId))
+        {
+            return;
         }
-    }
 
-    //如果到最后还有一部分没有收到，则加上
-    if(nRangeStartIndex >= 0){
-        arrMissingRangeList.append(SReliablePacketRange(static_cast<quint64>(nRangeStartIndex),static_cast<quint64>(nBitCount - 1)));
-    }
+        int &nLatestCompletedCount = m_mapReceiveProgress[oTransferId];
+        nLatestCompletedCount = qMax(nLatestCompletedCount,nCompletedPacketCount);
+        emit SignalReceiveProgress(strFileName,nLatestCompletedCount,nTotalPacketCount);
+    });
 
-    return arrMissingRangeList;
-}
-
-QString ReliableTransferManager::BuildAvailableFilePath(const QString &strPreferredFilePath) const
-{
-    if(!QFileInfo::exists(strPreferredFilePath)){//如果该文件路径不存在，直接返回就行
-        return strPreferredFilePath;
-    }
-
-    //如果存在，就必须特殊处理,找到一个不存在的，然后返回它
-    QFileInfo oFileInfo(strPreferredFilePath);
-    const QString strBaseName = oFileInfo.completeBaseName();
-    const QString strSuffix = oFileInfo.completeSuffix();
-    const QString strDirectory = oFileInfo.absolutePath();
-
-    for(int nIndex = 1; nIndex < 10000; ++nIndex){
-        const QString strCandidatePath = QDir(strDirectory).filePath(strSuffix.isEmpty() ? QStringLiteral("%1_%2").arg(strBaseName).arg(nIndex) :  QStringLiteral("%1_%2.%3").arg(strBaseName).arg(nIndex).arg(strSuffix));
-        if(!QFileInfo::exists(strCandidatePath)){
-            return strCandidatePath;
+    //转发接收完成通知，同一个任务只向外通知一次。
+    connect(pWorker,&ReliableReceiverWorker::SignalReceiveFinished,this,[this,nGeneration]
+            (const QUuid &oTransferId,const QString &strFilePath)
+    {
+        if (nGeneration != m_nReceiverGeneration ||
+            m_setCompletedSessions.contains(oTransferId))
+        {
+            return;
         }
-    }
 
-    return QString();//失败时返回空字符串。
+        //先登记完成，再向外通知。
+        m_setCompletedSessions.insert(oTransferId);
 
+        //任务已完成，不再需要保存它的进度记录。
+        m_mapReceiveProgress.remove(oTransferId);
+
+        emit SignalReceiveFinished(strFilePath);
+
+    });
+
+
+
+    //第五段：线程自然结束时，从管理列表移除并安排释放。
+    const QPointer<QThread> pGuard(pThread);
+
+    connect(pThread,&QThread::finished,this,[this,pGuard]()
+    {
+       //StopListening() 可能已经等待并删除了这个线程对象。
+        if(pGuard.isNull())
+       {
+           return;
+       }
+        m_arrReceiverThreads.removeAll(pGuard.data());
+        pGuard->deleteLater();
+    });
+
+    //全部连接建立好后，再登记并启动线程。
+    m_arrReceiverThreads.append(pThread);
+    pThread->start();
 }
-
-QString ReliableTransferManager::EncodeBitArray(const QBitArray &oBitArray) const
-{
-    QByteArray arrBytes;// 创建空的字节数组，保存序列化结果
-    QDataStream oDataStream(&arrBytes,QIODevice::WriteOnly);// 将数据流绑定到 arrBytes，以只写模式写入
-    oDataStream << oBitArray;// 位图 → 二进制字节
-//    QByteArray base64Bytes = arrBytes.toBase64(); // 得到 Base64 文本的字节
-//    QString text = QString::fromLatin1(base64Bytes); // 转成 QString,按 Latin-1 编码
-    return QString::fromLatin1(arrBytes.toBase64());// 字节 → Base64 字符串
-}
-
-QBitArray ReliableTransferManager::DecodeBitArray(const QString &strBase64, int nBitCount) const
-{
-    QByteArray arrBytes = QByteArray::fromBase64(strBase64.toLatin1());
-    QDataStream oDataStream(&arrBytes,QIODevice::ReadOnly);
-    QBitArray oBitArray;
-    oDataStream >> oBitArray;
-    oBitArray.resize(nBitCount);
-    return oBitArray;
-}
-
 

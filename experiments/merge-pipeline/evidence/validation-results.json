@@ -1,0 +1,17 @@
+{
+  "backup_verified": true,
+  "changed_project_files": [
+    "MyServer.pro",
+    "ReliableMergeHasher.cpp",
+    "ReliableMergeHasher.h",
+    "ReliableReceiveSession.cpp",
+    "ReliableReceiveSession.h"
+  ],
+  "session_checks_per_mode": 18,
+  "pipeline_checks": 12,
+  "active_cancel_and_retry_both_modes": true,
+  "real_ui_tcp_transfers": 4,
+  "packaged_clean_path_startup_both_modes": true,
+  "zip_crc_ok": true,
+  "compiler_warnings": 0
+}

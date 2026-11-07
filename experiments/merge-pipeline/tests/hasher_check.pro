@@ -1,0 +1,10 @@
+QT = core
+CONFIG += console c++17 release
+CONFIG -= app_bundle debug
+TEMPLATE = app
+TARGET = hasher_check
+TASK_SOURCE = $$quote($$PWD/../source)
+INCLUDEPATH += $$TASK_SOURCE
+SOURCES += hasher_check.cpp $$quote($$TASK_SOURCE/ReliableSha256.cpp) $$quote($$TASK_SOURCE/ReliableMergeHasher.cpp)
+HEADERS += $$quote($$TASK_SOURCE/ReliableSha256.h) $$quote($$TASK_SOURCE/ReliableMergeHasher.h)
+win32: LIBS += -lbcrypt

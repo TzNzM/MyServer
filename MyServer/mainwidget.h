@@ -2,7 +2,7 @@
 #define MAINWIDGET_H
 
 #include <QWidget>
-#include "transferdefaults.h"
+#include "TransferController.h"
 
 class QComboBox;
 class QLineEdit;
@@ -22,7 +22,15 @@ class MainWidget : public QWidget
     Q_OBJECT //Q_OBJECT 本质上是一个宏。
 
 public:
-    MainWidget(QWidget *parent = nullptr);
+    /**
+     * @brief MainWidget
+     * @param pParent Qt 父对象指针。
+     * @return 无
+     * @details 初始化主界面并绑定传输控制器信号。
+     */
+    explicit MainWidget(QWidget *pParent = nullptr);
+
+
     ~MainWidget();
 
 private slots:
@@ -62,7 +70,8 @@ private slots:
      * @brief OnSendFileClicked
      * @param 无
      * @return 无
-     * @details 发起一次 TCP 长连接文件发送任务（待接入）。
+     * @details 读取发送参数并启动后台任务；启动失败时恢复界面，
+     *          任务启动后的进度和最终结果由控制器信号通知。
      */
     void OnSendFileClicked();
 
@@ -88,7 +97,7 @@ private slots:
      * @param bSuccess 发送是否成功。
      * @param strMessage 完成时的提示消息。
      * @return 无
-     * @details 在发送会话结束后恢复界面可操作状态。
+     * @details 在所有发送线程结束后恢复界面可操作状态。
      */
     void OnSendFinished(bool bSuccess, const QString &strMessage);
 
@@ -126,7 +135,7 @@ private:
      * @brief GetSegmentSizeBytes
      * @param 无
      * @return 当前界面配置的分片大小字节数。
-     * @details 结合数值和单位下拉框，换算出分片大小的真实字节数。
+     * @return 合法的分片大小字节数；超出允许范围返回 0。
      */
     int GetSegmentSizeBytes() const;
 
@@ -146,14 +155,17 @@ private:
      */
     void AppendLogMessage(const QString &strMessage);
 
+
+    TransferController *m_pTransferController;//传输控制器，以当前窗口为 Qt 父对象。
     QLineEdit *m_pBindIpLineEdit;//输入监听IP的地址
     QLineEdit *m_pTargetIpLineEdit;//输入目标的IP地址
     NoWheelSpinBox *m_pListenPortSpinBox;//输入监听的端口
     NoWheelSpinBox *m_pSendPortSpinBox;//输入发送的端口
-    NoWheelSpinBox *m_pThreadCountSpinBox;//TCP 发送窗口：允许同时未确认的分片数
+    NoWheelSpinBox *m_pThreadCountSpinBox; // 请求的数据发送线程数，不包含协调线程
+    NoWheelSpinBox *m_pWindowSizeSpinBox;  // 每条数据连接允许同时等待 ACK 的分片数
     NoWheelSpinBox *m_pSegmentSizeSpinBox;//网络分片大小：一个文件块再拆成多大的网络包载荷
     QComboBox *m_pSegmentUnitComboBox;// 选择网络分片大小的单位（KB/MB）
-    QLabel *m_pThreadCountLabel;          // 显示发送窗口配置项的文字说明
+    QLabel *m_pThreadCountLabel;          // 显示数据发送线程数配置项的文字说明
     QLabel *m_pSegmentSizeLabel;          // 显示网络分片大小配置项的文字说明
     QLineEdit *m_pFilePathLineEdit;       // 输入或显示待发送文件的路径
     QLineEdit *m_pOutputDirectoryLineEdit;// 输入或显示接收文件的保存目录

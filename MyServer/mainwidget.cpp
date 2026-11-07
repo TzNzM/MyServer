@@ -1,6 +1,8 @@
 #include "mainwidget.h"
 #include "ui_mainwidget.h"
 #include "nowheelspinbox.h"
+#include "ReliableTransferTypes.h"
+#include "transferdefaults.h"
 
 #include <QComboBox>
 #include <QDateTime>
@@ -21,12 +23,13 @@
 
 MainWidget::MainWidget(QWidget *pParent)
     : QWidget(pParent),
-//      m_pTransferController(new TransferController(this)),
+      m_pTransferController(new TransferController(this)),
       m_pBindIpLineEdit(nullptr),
       m_pTargetIpLineEdit(nullptr),
       m_pListenPortSpinBox(nullptr),
       m_pSendPortSpinBox(nullptr),
       m_pThreadCountSpinBox(nullptr),
+      m_pWindowSizeSpinBox(nullptr),
       m_pSegmentSizeSpinBox(nullptr),
       m_pSegmentUnitComboBox(nullptr),
       m_pThreadCountLabel(nullptr),
@@ -43,7 +46,38 @@ MainWidget::MainWidget(QWidget *pParent)
     setObjectName(QStringLiteral("MainWidget"));
     InitializeUI();
 
-    //ToDo Connect函数中关于TransferController的
+    //第一段：将控制器日志显示到界面。
+    connect(
+        m_pTransferController,
+        &TransferController::SignalLogMessage,
+        this,
+        &MainWidget::OnLogMessageAppended);
+
+    //第二段：更新发送进度，并处理发送结果。
+    connect(
+        m_pTransferController,
+        &TransferController::SignalSendProgress,
+        this,
+        &MainWidget::OnSendProgressChanged);
+
+    connect(
+        m_pTransferController,
+        &TransferController::SignalSendFinished,
+        this,
+        &MainWidget::OnSendFinished);
+
+    //第三段：更新接收进度，并显示最终文件路径。
+    connect(
+        m_pTransferController,
+        &TransferController::SignalReceiveProgress,
+        this,
+        &MainWidget::OnReceiveProgressChanged);
+
+    connect(
+        m_pTransferController,
+        &TransferController::SignalReceiveFinished,
+        this,
+        &MainWidget::OnReceiveFinished);
 
     // 设置默认的地址路径
     const QString strDefaultDownloadPath = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
@@ -51,11 +85,12 @@ MainWidget::MainWidget(QWidget *pParent)
                                                  ? QDir::currentPath()
                                                  : strDefaultDownloadPath;
     m_pOutputDirectoryLineEdit->setText(strDefaultOutputDirectory);
-    //ToDo m_pTransferController->SetOutputDirectory(strDefaultOutputDirectory);
+    m_pTransferController->SetOutputDirectory(strDefaultOutputDirectory);
     UpdateReceiverButtons(false);
-    AppendLogMessage(QStringLiteral("当前为 TCP 长连接复现界面；监听和发送模块尚待接入。"));
+    AppendLogMessage(
+        QStringLiteral("TCP 多通道文件传输已就绪，可启动监听或发送文件。"));
 
-    setWindowTitle(QStringLiteral("TCP 长连接文件传输（复现中）"));
+    setWindowTitle(QStringLiteral("TCP 长连接"));
     resize(860, 640);
 }
 
@@ -78,27 +113,128 @@ void MainWidget::OnBrowseOutputDirectoryClicked()
     QString strOutputDirectory = QFileDialog::getExistingDirectory(this,QStringLiteral("选择接收输出目录"),m_pOutputDirectoryLineEdit->text().trimmed());
     if(!strOutputDirectory.isEmpty()){
         m_pOutputDirectoryLineEdit->setText(strOutputDirectory);
-        //To do
-        //m_pTransferController->SetOutputDirectory(strOutputDirectory);//传入Controller
+        m_pTransferController->SetOutputDirectory(strOutputDirectory);//传入Controller
     }
 }
 
 void MainWidget::OnStartReceiverClicked()
 {
-    // TODO: 接入可靠 TCP 接收管理器，监听成功后再更新按钮状态。
-    AppendLogMessage(QStringLiteral("TCP 长连接接收模块尚待复现。"));
+    //第一段：读取监听配置，并同步输出目录。
+    const QString strBindIp =
+        m_pBindIpLineEdit->text().trimmed();
+
+    const int nPort = m_pListenPortSpinBox->value();
+
+    m_pTransferController->SetOutputDirectory(m_pOutputDirectoryLineEdit->text().trimmed());
+
+    //第二段：启动监听，失败时显示原因。
+    QString strErrorMessage;
+    if (!m_pTransferController->StartReceiver(
+            strBindIp,
+            nPort,
+            strErrorMessage))
+    {
+        AppendLogMessage(
+            QStringLiteral("启动接收端失败：%1")
+                .arg(strErrorMessage));
+
+        QMessageBox::warning(
+            this,
+            QStringLiteral("启动失败"),
+            strErrorMessage);
+
+        return;
+    }
+
+    //第三段：监听成功后更新界面。
+    UpdateReceiverButtons(true);
+
+    m_pReceiveStatusLabel->setText(
+        QStringLiteral("正在监听：%1:%2，等待发送端连接。")
+            .arg(strBindIp.isEmpty()
+                     ? QStringLiteral("0.0.0.0")
+                     : strBindIp)
+            .arg(nPort));
 }
 
 void MainWidget::OnStopReceiverClicked()
 {
-    // TODO: 接入可靠 TCP 接收管理器，停止监听后更新按钮状态。
-    AppendLogMessage(QStringLiteral("TCP 长连接接收模块尚待复现。"));
+    //第一段：停止监听，并等待接收线程退出。
+    m_pTransferController->StopReceiver();
+
+    //第二段：恢复界面状态。
+    UpdateReceiverButtons(false);
+
+    m_pReceiveStatusLabel->setText(
+            QStringLiteral("接收端已停止。"));
+    AppendLogMessage(
+        QStringLiteral("接收端已停止，接收线程已回收。"));
+
 }
 
 void MainWidget::OnSendFileClicked()
 {
-    // TODO: 接入 ReliableSenderWorker，整次文件传输复用同一个 socket。
-    AppendLogMessage(QStringLiteral("TCP 长连接发送模块尚待复现。"));
+    //第一段：读取界面中的发送参数。
+    const QString strFilePath =
+        m_pFilePathLineEdit->text();
+
+    const QString strTargetIp =
+        m_pTargetIpLineEdit->text().trimmed();
+
+    const int nPort = m_pSendPortSpinBox->value();
+    const int nThreadCount = m_pThreadCountSpinBox->value();
+    const int nWindowSize = m_pWindowSizeSpinBox->value();
+    const int nSegmentSize = GetSegmentSizeBytes();
+
+    if(strFilePath.isEmpty())
+    {
+        QMessageBox::warning(
+                    this,
+                    QStringLiteral("无法发送"),
+                    QStringLiteral("请先选择待发送文件。"));
+                return;
+    }
+
+    if (nSegmentSize <= 0)
+    {
+        QMessageBox::warning(
+            this,
+            QStringLiteral("无法发送"),
+            QStringLiteral("分片大小必须大于 0，且不超过 4 MiB。"));
+        return;
+    }
+
+    //第三段：准备本次任务的界面状态，避免重复点击。
+    m_pSendFileButton->setEnabled(false);
+    m_pSendProgressBar->setRange(0, 1);
+    m_pSendProgressBar->setValue(0);
+    m_pSendProgressBar->setFormat(
+        QStringLiteral("正在准备文件并计算 SHA-256……"));
+    //第四段：启动后台发送任务，启动失败时恢复按钮。
+    QString strErrorMessage;
+    if(!m_pTransferController->StartSend(
+                strFilePath,
+                strTargetIp,
+                nPort,
+                nThreadCount,
+                nWindowSize,
+                nSegmentSize,
+                strErrorMessage))
+    {
+        m_pSendFileButton->setEnabled(true);
+        m_pSendProgressBar->setFormat(QStringLiteral("发送任务未启动"));
+        AppendLogMessage(
+                    QStringLiteral("启动发送失败：%1")
+                        .arg(strErrorMessage));
+        QMessageBox::warning(
+                    this,
+                    QStringLiteral("启动发送失败"),
+                    strErrorMessage);
+        return;
+    }
+
+    AppendLogMessage(
+            QStringLiteral("发送任务已启动，正在后台准备文件。"));
 }
 
 void MainWidget::OnLogMessageAppended(const QString &strMessage)
@@ -156,9 +292,17 @@ void MainWidget::InitializeUI()
     m_pSendPortSpinBox->setValue(8899);
 
     m_pThreadCountSpinBox = new NoWheelSpinBox(this);
-    m_pThreadCountSpinBox->setRange(1, 32);
-    m_pThreadCountSpinBox->setValue(g_nDefaultSendWindowSize);
-    m_pThreadCountSpinBox->setToolTip(QStringLiteral("允许同时已发送但未收到 ACK 的分片数。"));
+    m_pThreadCountSpinBox->setRange(1, g_nReliableMaxThreadCount);
+    m_pThreadCountSpinBox->setValue(g_nReliableDefaultSendThreadCount);
+    m_pThreadCountSpinBox->setToolTip(QStringLiteral("请求的数据发送线程数，接收端为每条数据连接创建对应线程；"
+                                                                                   "不包含额外的协调连接。"));
+    m_pWindowSizeSpinBox = new NoWheelSpinBox(this);
+    m_pWindowSizeSpinBox->setRange(1,g_nReliableMaxWindowSize);
+    m_pWindowSizeSpinBox->setValue(g_nReliableDefaultWindowSize);
+    m_pWindowSizeSpinBox->setToolTip(
+        QStringLiteral(
+            "每条数据连接允许同时已发送但未收到业务 ACK 的分片数。"));
+
 
     m_pSegmentSizeSpinBox = new NoWheelSpinBox(this);
     m_pSegmentSizeSpinBox->setRange(1, 4096);
@@ -169,7 +313,7 @@ void MainWidget::InitializeUI()
     m_pSegmentUnitComboBox->addItem(QStringLiteral("MB"), 1024 * 1024);
     m_pSegmentUnitComboBox->setCurrentIndex(0);
 
-    m_pThreadCountLabel = new QLabel(QStringLiteral("发送窗口"), this);
+    m_pThreadCountLabel = new QLabel(QStringLiteral("数据发送线程数"), this);
     m_pSegmentSizeLabel = new QLabel(QStringLiteral("分片大小"), this);
 
     QWidget *pSegmentSizeWidget = new QWidget(this);
@@ -208,6 +352,7 @@ void MainWidget::InitializeUI()
     pConfigurationFormLayout->addRow(QStringLiteral("接收端端口"), m_pListenPortSpinBox);
     pConfigurationFormLayout->addRow(QStringLiteral("目标接收端端口"), m_pSendPortSpinBox);
     pConfigurationFormLayout->addRow(m_pThreadCountLabel, m_pThreadCountSpinBox);
+    pConfigurationFormLayout->addRow(QStringLiteral("每通道发送窗口"),m_pWindowSizeSpinBox);
     pConfigurationFormLayout->addRow(m_pSegmentSizeLabel, pSegmentSizeWidget);
     pConfigurationFormLayout->addRow(QStringLiteral("发送文件"), pFileWidget);
     pConfigurationFormLayout->addRow(QStringLiteral("接收目录"), pOutputWidget);
@@ -253,11 +398,26 @@ void MainWidget::UpdateReceiverButtons(bool bListening)
 {
     m_pStartReceiverButton->setEnabled(!bListening);
     m_pStopReceiverButton->setEnabled(bListening);
+
+    //监听期间禁止修改监听地址和端口
+    m_pBindIpLineEdit->setEnabled(!bListening);
+    m_pListenPortSpinBox->setEnabled(!bListening);
 }
 
 int MainWidget::GetSegmentSizeBytes() const
 {
-    return static_cast<int>(static_cast<qint64>(m_pSegmentSizeSpinBox->value()) * GetSizeUnitMultiplier(m_pSegmentUnitComboBox));
+    const qint64 nSegmentSize =
+        static_cast<qint64>(m_pSegmentSizeSpinBox->value())
+        * GetSizeUnitMultiplier(m_pSegmentUnitComboBox);
+
+    //先检查范围，再转换为发送接口需要的 int。
+    if (nSegmentSize <= 0 ||
+        nSegmentSize > g_nReliableMaxSegmentSize)
+    {
+        return 0;
+    }
+
+    return static_cast<int>(nSegmentSize);
 }
 
 qint64 MainWidget::GetSizeUnitMultiplier(const QComboBox *pUnitComboBox) const

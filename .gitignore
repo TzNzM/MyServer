@@ -49,3 +49,9 @@ CMakeLists.txt.user*
 compile_commands.json
 *creator.user*
 *_qmlcache.qrc
+
+# Local backups, deployment bundles and historical scratch evidence
+/backups/
+/dist/
+/experiments/legacy-validation-sources.zip
+/experiments/merge-pipeline/evidence/Network项目解析-before-cleanup.md

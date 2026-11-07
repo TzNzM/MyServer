@@ -1,349 +1,46 @@
-# MyServer：复现路线、验收清单与 Agent 交接
-
-## 1. 项目背景和用户目标
-
-用户正在准备 C++ / Qt 面试，逐步手写复现参考工程 QtLargeFileTransfer，希望理解每段代码及其设计理由。
-目标项目是 MyServer，主线只聚焦可靠 TCP 长连接文件传输；UDP 和 TCP 短连接原型保留在归档分支。
-当前任务是学习与复现，不是把参考工程整套代码一次复制过来，也不是已经完成的传输产品。
-
-- 本地 Git 仓库根目录：`D:\Qt test\MyServer`
-- 实际 qmake 工程：`D:\Qt test\MyServer\MyServer\MyServer.pro`
-- 参考工程：`D:\Qt test\QtLargeFileTransfer\src`
-- GitHub 公开仓库：https://github.com/TzNzM/MyServer
-- Qt 版本：5.14.2，MinGW 64 位；C++17。
-- 本文是交接基线；后续 Agent 必须以最新源码和 Git 状态为准。
-
-## 2. 当前基线（2026-10-16）
-
-已完成：
-
-- [x] 初始化 Git，沿用远程最初的提交历史。
-- [x] 将清理前完整源码、学习注释保存为归档提交 `83f8441`。
-- [x] 主线移除旧短连接通道和旧协议文件，清理 UDP、块大小及模式切换 UI。
-- [x] 保留 MainWidget、NoWheelSpinBox、QSS 和资源文件。
-- [x] 添加 `transferdefaults.h`，只保存发送窗口和分片大小默认值。
-- [x] 主线清理提交 `703c537` 已通过 Qt 5.14.2 / MinGW 编译并上传。
-- [x] 本地归档分支改名为 `archive/unfinished-udp-tcp-short`。
-- [x] README 分支名更新提交为 `e28073e`。
-- [x] 远程归档分支改名完成：新旧名称的提交核对一致后删除旧名称。
-- [x] 本地归档 upstream 已更新为 `origin/archive/unfinished-udp-tcp-short`。
-- [ ] 每次更新文档或代码后推送 main 并核对远程提交（持续维护项）。
-- [x] 添加 `ReliableTransferTypes.h`，定义协议常量、枚举、包头、元信息、缺失范围和未确认分片记录。
-- [x] 添加 `ReliablePacketCodec.h/.cpp`，写出包头编解码、七种消息封包及对应载荷解析，并加入 `.pro`。
-- [x] 用户已修正范围转换辅助函数的返回值：构建函数补上返回值，解析函数在循环结束后返回全部范围。
-- [x] 2026-10-13 在 `build-upload-check` 执行 qmake 和 `mingw32-make -j4`，Qt 5.14.2 / MinGW 64 位 Debug 构建通过。
-- [x] 添加 `ReliableTransferManager.h/.cpp` 并加入 `.pro`，接收端主要函数已写出：监听、连接管理、缓存拆包、Metadata/Data/CompleteRequest 处理、状态持久化与恢复、最终校验和文件生成。
-- [x] 用户已将 `HandleDataPacket()` 中临时文件打开模式修正为 `ReadWrite`，并统一状态位图字段名为 `receivedPacketBitmap`。
-- [x] `BuildAvailableFilePath()` 在候选耗尽时返回空字符串；创建会话和最终生成文件时均已检查空路径。
-- [x] 2026-10-16 在 `build-upload-check` 再次执行 qmake 和 `mingw32-make -j4`，Debug 编译、链接通过。
-- [ ] `StartSend()` 只有 `//To do`，无返回值；当前构建有缺少返回值和参数未使用警告，调用该空实现会产生未定义行为。应先返回明确失败，或在 Worker 接入时补全。
-- [ ] 协议往返、半包/粘包、非法输入测试尚未执行；版本、消息类型、载荷上限和数值转换等校验仍需完善。
-- [x] 用户在本次提交准备期间新建 `ReliableSenderWorker.h/.cpp` 空类骨架并加入 `.pro`，目前只有默认构造函数。
-- [ ] Worker 的 QObject 继承、Q_OBJECT、发送信号和 ProcessSend 接口尚未添加；发送线程启动、窗口、超时重传与重连调度待实现。`TransferController` 尚未创建。
-- [ ] 接收端代码尚未经收发联调和进程重启恢复验收，不能仅凭构建通过宣称传输、续传或校验行为完成。
+# MyServer 当前版本与交接
 
-下一步先收尾协议与接收端输入校验，再在 `ReliableSenderWorker.h/.cpp` 空类骨架上补齐最小接口（QObject、Q_OBJECT、信号、ProcessSend），配合补齐 Manager 的 StartSend 线程与生命周期调度，然后逐步实现发送并进行首次收发联调。Controller 和 UI 接入随后进行。
+## 工作目录与目标
 
-本次检查发现的后续完善项：状态文件写入结果检查和原子更新；分片序号、偏移、长度的一致性校验；哈希读取错误处理；多点文件名重名处理（`completeBaseName()` 搭配 `completeSuffix()` 会重复部分扩展名）。均未在本次上传中改动源码。
+- 仓库：`D:\Qt test\MyServer`；工程：`MyServer/MyServer.pro`。
+- 参考工程：`D:\Qt test\QtLargeFileTransfer`，与 MyServer 是独立工程。
+- 用户逐步手写复现并学习 C++ / Qt，保留现有学习注释，修改限于当前任务需要。
+- Qt 5.14.2 / MinGW 64 位，C++17；当前主线只有可靠 TCP 长连接。
 
-MainWidget 的发送/监听按钮目前只输出“尚待复现”的日志，不执行网络传输。
-“发送窗口”表示允许同时未确认的分片数量，不是并发线程数量。
-当前默认监听 `0.0.0.0:8899`，目标 `127.0.0.1:8899`，分片为 60 KB。
+## 当前实现
 
-写本文时工作区中另有 4 个用户未跟踪文件：
+协议为 v3、62 字节包头、单 SHA-256。一条控制连接协调 N 条数据连接，每条数据通道有对应发送、接收线程及独立通道文件。发送线程数与每通道窗口分别配置。
 
-```text
-MyServer/abstracttransferchannel.cpp
-MyServer/abstracttransferchannel.h
-MyServer/tcptransferchannel.cpp
-MyServer/tcptransferchannel.h
-```
+Types、Utils、Codec、Session、独立 Store、TcpServer、ReceiverWorker、TransferIo、SendTaskState、SendLane、SenderWorker、Manager、Controller 和界面收发入口均已接通。
 
-这些文件属于用户当前工作，不在主线 qmake SOURCES / HEADERS 中。不要自动删除或通过 `git add .` 把它们带进长连接主线；处理前先明确用户意图。
+当前合并方式只有串行：完成请求由接收 Worker 调用 Session，在该后台线程按通道顺序读取，使用一个 4 MiB 缓冲区写入并计算摘要，校验通过后提交文件、改名和清理。没有独立摘要线程、模式环境变量、合并计时参数或性能日志。网络超时计时器继续保留。
 
-## 3. 参考工程实际采用的网络方式
+ReliableSha256 在 Windows 使用 CNG、Linux 使用 OpenSSL EVP，其余平台使用 Qt。发送前读文件计算摘要和接收合并时的摘要均走该封装；Codec 中短会话身份字符串的 Qt 哈希仍保留。
 
-正式 TCP 调用链：
+## 模块边界
 
-```text
-MainWidget
-  → TransferController（仅保留可靠 TCP 调度）
-  → ReliableTransferManager
-      → 接收：QTcpServer + 各连接的 QTcpSocket / 接收缓存 / 会话状态
-      → 发送：QThread + ReliableSenderWorker::ProcessSend()
-                    → 一个 QTcpSocket 贯穿本次传输
-```
+- Codec：字节表示、拆包、JSON 和字段校验。
+- Session：一个文件的接收状态、分片写入、持久化与恢复、串行合并和校验。
+- Store：共享 Session、连接通道占用、续传目录归属和共享停止标记。
+- Worker：所属接收线程中的 socket、缓存、消息分发和回复。
+- Manager：监听、线程生命周期、进度汇总和通知转发。
+- SenderWorker：后台协调线程；SendLane：各数据发送线程。
+- Controller 和 MainWidget：主线程中的调度入口与界面更新。
 
-参考发送端在后台线程中运行 `ProcessSend()`，函数内创建局部 `QTcpSocket`。
-该 socket 在整个传输循环期间持续存在，使用 `waitForConnected()`、`waitForBytesWritten()`、
-`waitForReadyRead()` 进行阻塞式等待；断线时可以重新连接并恢复会话。
-参考接收端通过 `newConnection`、`readyRead` 和 `disconnected` 信号处理连接。
+## 当前证据与边界
 
-因此，“socket 是局部变量”不等于“短连接”，应看它贯穿一次 SendPacket 还是贯穿整个文件发送过程。
-“长连接/短连接”和“阻塞/异步”是两个独立维度。当前复现可先遵循参考的后台阻塞发送方式，
-不必先改成全异步状态机；阻塞发送与哈希计算不能放在 UI 主线程。
+`tests/` 保存当前回归源码；`build-release/validation-results.json` 汇总当前构建与测试结果。覆盖会话 18 项、摘要 42 组及状态检查、真实界面调用链的本机 TCP 普通文件和小文件收发。用户已成功传输约 6.64 GiB 文件。
 
-`write()` / `bytesWritten` 只反映本地发送进度。业务 ACK 才能表示接收端已经接受某个分片，
-最终成功须以接收端完整性校验后返回的 Result 为准。
+两台真实电脑、全新外机及真实 Linux 编译运行尚未验收。取消发送已有后台接口与检查点，但界面没有取消按钮。逐片业务超时补传仍保留，不能把它解释为 TCP 自身需要额外重传。“原子保存状态失败：拒绝访问”曾出现，当前测试未复现，不能宣称已经解决。
 
-参考可靠协议与旧协议不同：
+## 实验归档和产物
 
-- 固定包头为 80 字节，版本 1，魔数 `0x52544650`。
-- 消息类型：Metadata(101)、ResumeState(102)、Data(103)、Ack(104)、CompleteRequest(105)、Result(106)、Error(107)。
-- 用分片序号和文件偏移定位数据，不沿用旧协议的 Chunk/Segment 两级切分。
-- UUID 固定编码为 RFC 4122 的 16 字节；包头字段须显式序列化，不用 sizeof(struct) 作为网络格式。
-- 应用层 ACK / 续传用于追踪业务分片和恢复状态；TCP 本身已经提供有序可靠字节流，不能把 TCP 简单描述成需要应用层补救的“丢包协议”。
+流水线及 A/B 模式源码在 `experiments/merge-pipeline/source/`，测试源码和证据在同级目录。最新同工程实测为流水线 14,003.6 ms、串行 9,138.4 ms；流水线多耗时约 53.2%，差异主要在文件操作，具体根因尚未确认。用户决定主工程采用串行，并删除合并计时。
 
-## 4. 分阶段复现顺序与验收清单
+只保留当前 `build-release/` 和 `dist/MyServer-win64/`、`dist/MyServer-win64.zip`。历史辅助测试源码已压缩保留，旧的编译和打包目录已清理，已有源码备份保留在 backups 中。不要把实验归档当成当前生产代码。
 
-每阶段仅实现当前所需部分，编译、验证后提交；不要一次复制完整的大类。
-Manager 与 Worker 互有依赖，可先拆出最小骨架和接口，再逐步补齐，不要求按文件整份完成。
+## 构建与笔记
 
-### 阶段 1：ReliableTransferTypes（类型已写出）
+Qt 工具：`D:\Qt\5.14.2\mingw73_64\bin`；MinGW：`D:\Qt\Tools\mingw730_64\bin`。在 build-release 中运行 qmake 和 mingw32-make，使用 windeployqt 对已有 Release EXE 收集依赖。本机此套部署工具不加 --release / --debug，避免已有 MinGW 插件识别问题。
 
-参考：`ReliableTransferTypes.h`。
-
-- [x] 定义可靠协议常量、消息枚举和固定包头。
-- [x] 定义文件元信息：传输 ID、会话键、文件名、大小、分片大小、总分片数、哈希。
-- [x] 定义缺失范围、未确认分片记录。
-- [ ] 能解释每个字段的单位、有效范围，以及 transferId 与持久会话身份的区别。
-- [ ] 确认缺失范围端点是否包含边界，避免发送/接收端产生 off-by-one。
-
-验收：头文件可编译；能手算包头编码长度和最后一个分片大小。
-
-### 阶段 2：ReliablePacketCodec
-
-参考：`ReliablePacketCodec.h/.cpp`。
-
-- [x] 实现包头编解码，统一使用大端字节序。
-- [x] 写出 Metadata、ResumeState、Data、ACK、CompleteRequest、Result、Error 的封包与对应载荷解析；行为测试待执行。
-- [x] 在 Manager 的 `OnSocketReadyRead()` 写出接收缓存拆包：不足一个包保留，多个完整包循环解析；半包/粘包测试待执行。
-- [ ] 校验 magic/version/type/header length、载荷上限、序号和偏移。
-- [ ] 大整数 JSON 编码避免精度丢失；解码必须检查转换是否成功。
-
-验收：测试完整包往返、拆成多次输入的半包、多个粘连包，以及错误长度/魔数。
-这些测试先不依赖 socket，便于定位协议问题。
-
-### 阶段 3：接收端最小骨架（主要代码已写出，待联调）
-
-参考：`ReliableTransferManager.h/.cpp` 的监听和接收部分。
-
-以下勾选表示对应代码已写出，不表示已经通过运行验收。
-
-- [x] 创建 QTcpServer，接入新连接。
-- [x] 每个 QTcpSocket 独立维护接收缓存，断开时移除缓存并安排对象释放。
-- [x] 收到 Metadata 后创建或恢复接收会话，并返回 ResumeState。
-- [x] 初次传输时按全 false 位图生成全部缺失范围。
-- [x] 收到 Data 后按偏移写入 .part 文件，用位图跳过重复写入并回复 ACK；分片字段校验仍需加强。
-- [x] CompleteRequest 后检查缺失范围，缺失时返回失败；齐全时进入最终哈希校验。
-- [ ] 通过本阶段运行验收，包括半包/粘包、重复分片、断开清理、状态恢复及完整文件校验。
-
-验收：接收端能监听；非法包不造成错误写入；日志能对应会话和分片。
-
-### 阶段 4：发送端最小长连接
-
-参考：`ReliableSenderWorker.h/.cpp`，以及 Manager 的 StartSend / QThread 生命周期。
-
-- [ ] 在工作线程创建并使用 socket，不跨线程直接操作同一个 socket。
-- [ ] 同一文件会话连接一次，完成 Metadata → ResumeState → 多个 Data → CompleteRequest → Result。
-- [ ] 逐段读取文件，内存不随整个文件大小增长。
-- [ ] 明确文件、socket、线程在正常结束、错误、窗口关闭时的清理流程。
-- [ ] 第一版允许先用串行发送；明确哪些可靠性机制尚未接入。
-
-验收：本机 1 MB 文件能完整传输；正常传输期间只接受一条连接；外部 SHA256 比较一致。
-第一次联调双方都使用 MyServer 的同一协议版本，阶段性简化不保证与参考成品互通。
-
-### 阶段 5：ACK，再加入发送窗口
-
-- [ ] 窗口先设为 1：收到 ACK 才推进下一分片。
-- [ ] ACK 在分片校验、写入成功后发出；解释写入成功与持久化到磁盘的区别。
-- [ ] 加入未确认分片表，记录序号、最近发送时间、重试次数。
-- [ ] 窗口提升到 N；在途未确认分片数始终不超过 N。
-- [ ] 重复 ACK 不重复计进度，非法 ACK 不改变状态。
-
-验收：使用多个窗口值传输；进度按已确认分片统计，CompleteRequest 不早于全部确认。
-
-### 阶段 6：超时补传与断线恢复
-
-- [ ] 超时只补发未确认分片，设置重试/重连次数上限。
-- [ ] 超时时间使用单调计时来源，避免系统时间调整影响。
-- [ ] 重连时清理旧字节缓存，重新握手，按接收端真实缺失范围恢复。
-- [ ] Result 等待也有明确超时/退出条件，不无限卡住。
-
-验收：在测试接收端故意延迟/忽略 ACK；传输中断连接；确认补传、恢复或可解释失败。
-TCP 正常情况下不会向应用交付“乱序分片”；可用人工重复/异常协议包测试业务健壮性。
-
-### 阶段 7：跨进程断点续传与最终校验
-
-- [ ] 持久化接收位图、文件信息和 state.json，考虑状态文件的原子更新。
-- [ ] 恢复时验证元信息匹配，不能仅凭文件名续传到另一个文件。
-- [ ] 位图与 .part 内容保持一致，明确崩溃后恢复策略。
-- [ ] 校验完整大小和 MD5 / SHA256；成功后重命名为正式文件，再回 Result。
-- [ ] 文件名与路径校验，禁止写出用户指定的输出目录；处理已有文件重名。
-- [ ] 无效状态文件或哈希不一致不能显示“传输成功”。
-
-验收：接收进程重启后恢复；截断/损坏 .part 后能识别问题；最终文件哈希一致。
-哈希用于完整性比对，不意味着具备加密或身份认证。
-
-### 阶段 8：TransferController 与 MainWidget 接入
-
-- [ ] Controller 仅转发可靠 TCP 的监听、发送、日志、进度与结果。
-- [ ] 监听成功后才更新按钮；启动失败时保留正确状态。
-- [ ] 发送成功/失败后恢复按钮，任务中避免重复提交。
-- [ ] UI 不阻塞，发送窗口与分片单位转换有效，避免整数溢出。
-- [ ] 明确空文件、多文件、取消操作是否支持，README 与实际能力一致。
-
-验收：文件不存在、连接拒绝、端口占用、断线、写盘失败均能给出明确反馈。
-
-### 阶段 9：面试展示与回归
-
-- [ ] 本机与局域网传输；大文件、边界分片、中文文件名、重名文件。
-- [ ] 保存测试记录：文件大小、窗口、分片大小、耗时、SHA256、故障恢复结果。
-- [ ] 能说明 TCP 字节流拆包、线程归属、ACK 的业务意义与续传身份。
-- [ ] README 只列已验证的功能，不把参考工程的功能当作 MyServer 已完成成果。
-- [ ] 不把其他 Agent 的推测直接当结论；涉及实现方式须阅读实际源码。
-
-## 5. GitHub 分支结构和当前同步状态
-
-计划稳定结构：
-
-```text
-origin (https://github.com/TzNzM/MyServer.git)
-├─ main
-│  └─ 可靠 TCP 长连接复现主线，按阶段更新
-└─ archive/unfinished-udp-tcp-short
-   └─ 旧学习快照：UDP / TCP 短连接部分未完成，保留原始注释
-```
-
-远程改名已完成，`archive/unfinished-udp-tcp-short` 指向归档提交 `83f8441`，
-旧远程分支 `archive/current-scaffold` 已删除，本地 upstream 已同步。
-README 的分支名称更新和本交接文档在 main 中维护，后续用下列命令核对实时状态。
-
-先检查实时状态：
-
-```powershell
-Set-Location 'D:\Qt test\MyServer'
-git status --short
-git branch -vv
-git remote -v
-git ls-remote --heads origin
-```
-
-本次远程改名已完成。以下保留改名流程供以后参考，无需再次执行已完成的步骤：
-
-```powershell
-git push -u origin archive/unfinished-udp-tcp-short
-git ls-remote --heads origin archive/current-scaffold archive/unfinished-udp-tcp-short
-```
-
-确认命令成功且两个远程分支指向同一提交（初始归档为
-`83f8441be7fc6a545a12eaf986a689cad4cda32d`），再执行：
-
-```powershell
-git push origin --delete archive/current-scaffold
-git push -u origin main
-git fetch --prune origin
-git branch -vv
-```
-
-若新分支推送失败、旧分支已经有新增提交或两者不一致，先保留旧分支并核对差异。
-已删除的只是旧分支名称，归档源码仍在新分支和本地提交中。
-
-## 6. 日常提交和上传更新
-
-在 main 学习并实现一个小阶段后，先构建、检查差异，再只暂存本次需要的文件：
-
-```powershell
-Set-Location 'D:\Qt test\MyServer'
-git status --short
-git branch --show-current
-git diff
-# 示例：完成协议定义后
-git add -- MyServer/reliabletransfertypes.h MyServer/MyServer.pro
-git diff --cached
-git commit -m "feat: define reliable TCP transfer protocol"
-git push origin main
-```
-
-上传本交接文档时：
-
-```powershell
-git add -- 复现路线与Agent交接.md
-git commit -m "docs: add reproduction roadmap and agent handoff"
-git push origin main
-```
-
-建议提交主题：协议编解码、接收会话、长连接发送、ACK 窗口、超时恢复、状态持久化、UI 接入。
-每次增加 .h/.cpp 后同步更新 .pro；每次更新功能后同步修改本文复现清单与 README。
-
-查看归档代码无需切换主工作区：
-
-```powershell
-git show archive/unfinished-udp-tcp-short:MyServer/tcptransferchannel.cpp
-```
-
-切分支前先检查未提交和未跟踪文件；旧分支有同名文件时，切换可能被阻止。不要强制覆盖。
-不执行 `git reset --hard`、`git clean -fd` 或强制推送来解决正常同步问题。
-
-GitHub 登录由用户在自己的终端/浏览器完成，不在聊天中索取密码或 Token。
-HTTPS 认证优先通过凭据管理器；若终端要求 Password，不使用 GitHub 账户密码，应按 GitHub 的认证方式处理。
-
-## 7. 构建与验证
-
-在 Qt Creator 打开 `MyServer/MyServer.pro`，选择 Qt 5.14.2 MinGW 64 位。
-命令行可用：
-
-```powershell
-Set-Location 'D:\Qt test\MyServer'
-$env:PATH = 'D:\Qt\Tools\mingw730_64\bin;D:\Qt\5.14.2\mingw73_64\bin;' + $env:PATH
-New-Item -ItemType Directory -Path build-tcp-main -Force | Out-Null
-Set-Location build-tcp-main
-qmake ../MyServer/MyServer.pro "CONFIG+=debug"
-# qmake 成功后再执行
-mingw32-make -j4
-```
-
-`build-tcp-main`、旧构建目录、.exe、.o、`*.pro.user` 已由 .gitignore 排除。
-编译通过只证明构建成立，不证明 ACK / 续传等行为成立；按各阶段验收单独验证。
-
-## 8. 给后续 Agent 的工作要求
-
-1. 先阅读本文、README、最新源码、Git 状态及适用 AGENTS.md，再判断当前进度。
-2. 用户偏好逐步手写、逐段解释。只回答问题时不要改文件；要求落盘时遵守指定修改范围。
-3. 未经请求不要一次实现剩余全部模块。先说明下一小阶段及其验收目标，再按请求推进。
-4. 主线保持可靠 TCP 范围；用户新写的短连接文件先保留，不自动混入构建或提交。
-5. 不覆盖用户现有修改，不删除构建目录或未跟踪文件，不把源码快照当可运行产品。
-6. 检查实际代码后区分：长连接生命周期、后台阻塞发送、接收端事件驱动。
-7. 正常发送结束、异常、重连、程序退出都要核对线程与对象生命周期。
-8. 不宣称功能完成、编译通过或上传成功，除非实际执行并取得结果。
-9. 当前执行环境曾出现隔离进程启动失败；允许使用产品提供的审批机制重试，不能假称命令已经运行。
-10. 更新本文的进度和同步状态，保留可供用户面试复述的设计理由及测试证据。
-
-## 9. 后续协议精简备忘（2026-10-13，尚未实施）
-
-用户希望先留痕，后续再自行修改。以下为待办和候选项，不表示已经修改或完成验收；当前继续沿用参考协议的 80 字节包头和双哈希设计。
-
-### 9.1 待办：评估删除未使用的 m_nFlags
-
-`SReliablePacketHeader::m_nFlags` 为 `quint16`，编码占 2 字节。参考实现当前置 0，未使用其业务含义；可以在传输流程跑通后评估删除。
-
-- [ ] 删除结构体中的 `m_nFlags` 和构造函数初始化项 `m_nFlags(0)`。
-- [ ] 同步删除 `ReliablePacketCodec::BuildPacket()` 中的写入项，以及 `ParsePacketHeader()` 中的读取项。
-- [ ] 若仅删除此字段，将固定包头长度由 80 改为 78 字节；同步核对收发双方的拆包、载荷起始位置和长度计算。
-- [ ] 更新协议版本，并补充版本校验，明确拒绝不兼容格式；修改后不再与参考工程原始格式直接互通。
-- [ ] 验证包头往返、Data/ACK 等消息、半包/粘包及旧格式拒绝行为；包头长度按显式编码计算，不使用 `sizeof(struct)`。
-
-### 9.2 候选：删除预留字段（尚未决定）
-
-此前讨论的 `m_nReserved`（4 字节）和 `m_nReserved64`（8 字节）也没有当前业务用途，但是否保留扩展空间尚未决定。
-
-- [ ] 若决定删除，同步调整成员、初始化、编码、解码和版本。
-- [ ] 三个字段 `m_nFlags`、`m_nReserved`、`m_nReserved64` 全部删除时，包头长度为 `80 - 2 - 4 - 8 = 66` 字节；仅删除两个预留字段时为 68 字节。
-
-### 9.3 候选：仅保留 SHA-256（尚未决定）
-
-文件完整性比较可以统一使用 SHA-256，是否删除 MD5 留待后续决定。
-
-- [ ] 若决定简化，同步调整发送端哈希计算、元信息字段、Metadata 编解码、状态文件、恢复匹配及最终文件校验。
-- [ ] 参考实现的 `sessionKey` 生成材料包含 MD5；删除后需明确新的生成规则，以及旧会话目录和状态文件如何迁移或隔离，不能默认继续复用旧续传记录。
-- [ ] 完成首次传输、重连续传、进程重启恢复和最终哈希比较验证后，再更新已实现清单。
+主学习笔记：`D:\Learning Documents\WorkFinding\cpp-python-review\07-QtWork\Network项目解析.md`。它按当前实现组织知识点，保留流水线实验结论，删除过期复现进度和过程路径；外部笔记修改前的副本保存在实验 evidence 目录。

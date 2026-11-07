@@ -6,6 +6,12 @@
 class ReliablePacketCodec
 {
 public:
+    /**
+     * @brief ReliablePacketCodec
+     * @param 无
+     * @return 无
+     * @details 保留原有构造接口；下面的静态函数仍可直接通过类名调用。
+     */
     ReliablePacketCodec();
 
     /**
@@ -31,29 +37,62 @@ public:
      * @param stPacketHeader 输出的包头结构。
      * @param strErrorMessage 输出错误信息。
      * @return 成功返回 true，否则返回 false。
-     * @details 将固定包头解析回结构化字段。
+     * @details 将 62 字节固定包头解析回结构化字段，并校验魔数、版本、类型、传输 ID 和载荷上限。
      */
     static bool ParsePacketHeader(const QByteArray &arrHeaderData, SReliablePacketHeader &stPacketHeader, QString &strErrorMessage);
+
+
+    /**
+     * @brief TryTakePacket
+     * @param arrBuffer 当前连接独立维护的接收缓存。
+     * @param stHeader 输出解析后的包头。
+     * @param arrPayload 输出当前完整包的载荷。
+     * @param bReady 输出是否已经取得一个完整包。
+     * @param strErrorMessage 输出非法包的原因。
+     * @return 缓存中的协议格式有效返回 true，格式非法返回 false。
+     * @details true 且 bReady 为 false 表示半包，保留缓存等待后续字节；完整包只移除自身，后续粘连包继续保留。
+     */
+    static bool TryTakePacket(QByteArray &arrBuffer, SReliablePacketHeader &stHeader,
+                              QByteArray &arrPayload, bool &bReady, QString &strErrorMessage);
+
+    /**
+     * @brief ValidateMetadata
+     * @param stMetadata 待校验的文件元信息。
+     * @param strErrorMessage 输出校验失败原因。
+     * @return 文件名、大小、分片数、通道数、摘要和会话键合法返回 true。
+     * @details 不校验 UUID，因为 Metadata 载荷中不保存 UUID，调用方从包头读取并关联当前任务。
+     */
+    static bool ValidateMetadata(const SReliableFileMetadata &stMetadata, QString &strErrorMessage);
+
+    /**
+     * @brief BuildSessionKey
+     * @param stMetadata 已设置文件 SHA-256、分片大小和实际通道数的元信息。
+     * @return 用于定位历史续传状态的稳定 SHA-256 会话键。
+     * @details 对 v3、文件名、文件大小、分片大小、实际通道数和文件 SHA-256 拼接后的 UTF-8 字节计算摘要。
+     */
+    static QString BuildSessionKey(const SReliableFileMetadata &stMetadata);
 
     /**
      * @brief BuildMetadataPacket
      * @param stMetadata 文件元信息。
-     * @param nWindowSize 发送端声明的窗口大小。
+     * @param nWindowSize 发送端声明的每条数据连接的窗口大小。
+     * @param nLaneIndex 本连接的通道编号；-1 为控制连接，0..N-1 为数据连接。
      * @return 元信息控制包。
      * @details 构造会话建立或断点续传恢复握手包。
      */
-    static QByteArray BuildMetadataPacket(const SReliableFileMetadata &stMetadata, int nWindowSize);
+    static QByteArray BuildMetadataPacket(const SReliableFileMetadata &stMetadata, int nWindowSize, int nLaneIndex = -1);
 
 
     /**
      * @brief ParseMetadataPayload
      * @param arrPayload 元信息 JSON。
      * @param stMetadata 输出的文件元信息。
+     * @param pLaneIndex 可选输出本连接的通道编号，不需要时可省略。
      * @param strErrorMessage 输出错误信息。
      * @return 成功返回 true，否则返回 false。
      * @details 将元信息 JSON 负载还原成可靠传输会话元数据。
      */
-    static bool ParseMetadataPayload(const QByteArray &arrPayload, SReliableFileMetadata &stMetadata, QString &strErrorMessage);
+    static bool ParseMetadataPayload(const QByteArray &arrPayload, SReliableFileMetadata &stMetadata, QString &strErrorMessage, int *pLaneIndex = nullptr);
 
     /**
      * @brief BuildResumeStatePacket
@@ -100,7 +139,7 @@ public:
      * @param stMetadata 文件元信息。
      * @param nPacketSequence 已确认收到的分片序号。
      * @return ACK 控制包。
-     * @details 接收端对每个已落盘分片进行确认。
+     * @details 接收端对每个已写入临时文件且更新内存位图的分片进行确认；ACK 不保证状态文件已保存或物理介质持久化。
      */
     static QByteArray BuildAckPacket(const SReliableFileMetadata &stMetadata, quint64 nPacketSequence);
 
@@ -109,7 +148,7 @@ public:
      * @brief BuildCompleteRequestPacket
      * @param stMetadata 文件元信息。
      * @return 完成请求包。
-     * @details 所有缺失分片补齐后通知接收端执行最终校验。
+     * @details 所有缺失分片补齐后，由控制连接通知接收端合并各通道临时文件并执行最终 SHA-256 校验。
      */
     static QByteArray BuildCompleteRequestPacket(const SReliableFileMetadata &stMetadata);
 
